@@ -36,7 +36,7 @@ if str(_PIPELINE) not in sys.path:
     sys.path.insert(0, str(_PIPELINE))
 
 import server.gemini_worker as gemini_worker_module  # noqa: E402
-from server.evaluation import EvaluationService, AgentRouter  # noqa: E402
+from server.evaluation import EvaluationService, AgentRouter, PolicyEngine  # noqa: E402
 from server.gemini_worker import (  # noqa: E402
     GeminiWorker,
     IDENTITY_PASS_THRESHOLD,
@@ -172,7 +172,10 @@ def _make_worker(judge_texts, judge_exc=None):
     w.active_session_id = None
     w._turn_counts = {}
     w._eval_service = EvaluationService()
-    w._agent_router = AgentRouter(identity_threshold_profile)
+    w._agent_router = PolicyEngine(
+        agent_router=AgentRouter(identity_threshold_profile),
+        learning_layer=None,
+    )
     w._face_swap_repair = FaceSwapRepair()
     w._face_swap_repair._load_failed = True  # tests have no model; skip face-swap
     # Build a minimal gateway that routes to our FakeClient
@@ -936,7 +939,10 @@ def _make_pipeline_worker(judge_texts, swap_result=None):
     w._face_swap_repair._load_failed = True
     w._ensure_session = lambda *a, **k: None  # type: ignore[assignment]
     w._eval_service = EvaluationService()
-    w._agent_router = AgentRouter(identity_threshold_profile)
+    w._agent_router = PolicyEngine(
+        agent_router=AgentRouter(identity_threshold_profile),
+        learning_layer=None,
+    )
     w.swap_calls = 0
 
     # Build gateway with FakePipelineClient

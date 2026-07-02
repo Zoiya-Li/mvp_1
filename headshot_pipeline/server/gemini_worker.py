@@ -16,7 +16,7 @@ import time
 from pathlib import Path
 
 from .config import settings
-from .evaluation import EvaluationService, AgentRouter
+from .evaluation import EvaluationService, AgentRouter, PolicyEngine
 from .generation import ImageGateway
 from .image_gateway import build_provider_invocation_metadata, estimate_cost
 from .learning import LearningLayer
@@ -403,7 +403,10 @@ class GeminiWorker:
         self._turn_counts: dict[str, int] = {}
         self._learning_layer = LearningLayer()
         self._eval_service = EvaluationService(learning_layer=self._learning_layer)
-        self._agent_router = AgentRouter(identity_threshold_profile)
+        self._agent_router = PolicyEngine(
+            agent_router=AgentRouter(identity_threshold_profile),
+            learning_layer=self._learning_layer,
+        )
         self._face_swap_repair = FaceSwapRepair()
         self._gateway = ImageGateway()
 
@@ -616,8 +619,11 @@ class GeminiWorker:
                 "selected": False,
                 "repair": None,
             }
-            action = self._agent_router.decide_candidate_action(
+            action = self._agent_router.decide(
                 judgement,
+                budget=metadata["budget"],
+                shot_spec=shot_spec,
+                session_feedback=metadata.get("history", []),
                 edit_count=0,
                 identity_repairs=0,
                 identity_thresholds=identity_thresholds,
@@ -731,8 +737,11 @@ class GeminiWorker:
                 "repair": None,
                 "regenerated_from_candidate_id": selected.get("candidate_id"),
             }
-            action = self._agent_router.decide_candidate_action(
+            action = self._agent_router.decide(
                 judgement,
+                budget=metadata["budget"],
+                shot_spec=shot_spec,
+                session_feedback=metadata.get("history", []),
                 edit_count=0,
                 identity_repairs=0,
                 identity_thresholds=identity_thresholds,
@@ -1138,8 +1147,11 @@ class GeminiWorker:
                 "selected": False,
                 "repair": None,
             }
-            action = self._agent_router.decide_candidate_action(
+            action = self._agent_router.decide(
                 judgement,
+                budget=metadata["budget"],
+                shot_spec=shot_spec,
+                session_feedback=metadata.get("history", []),
                 edit_count=0,
                 identity_repairs=0,
                 identity_thresholds=identity_thresholds,
@@ -1255,8 +1267,11 @@ class GeminiWorker:
                 "repair": None,
                 "regenerated_from_candidate_id": selected.get("candidate_id"),
             }
-            action = self._agent_router.decide_candidate_action(
+            action = self._agent_router.decide(
                 judgement,
+                budget=metadata["budget"],
+                shot_spec=shot_spec,
+                session_feedback=metadata.get("history", []),
                 edit_count=0,
                 identity_repairs=0,
                 identity_thresholds=identity_thresholds,
@@ -1544,7 +1559,12 @@ class GeminiWorker:
         identity_repairs: int = 0,
         identity_thresholds: dict | None = None,
     ) -> dict:
-        """Bounded state-machine action for one evaluated candidate."""
+        """Bounded state-machine action for one evaluated candidate.
+
+        NOTE: This static method preserves the original deterministic AgentRouter
+        behavior for backward compatibility in tests. The main runtime path uses
+        PolicyEngine for adaptive decisions.
+        """
         router = AgentRouter(identity_threshold_profile)
         return router.decide_candidate_action(
             judgement,
