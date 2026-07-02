@@ -21,7 +21,7 @@ import time
 from pathlib import Path
 
 from .config import settings
-from .evaluation import EvaluationService
+from .evaluation import EvaluationService, AgentRouter
 from .face_swap import FaceSwapper, FaceSwapResult
 from .image_gateway import build_provider_invocation_metadata, estimate_cost
 from .models import IdentityPack, ShotSpec
@@ -408,6 +408,7 @@ class GeminiWorker:
         self._face_swapper: FaceSwapper | None = None
         self._face_swap_load_failed: bool = False
         self._eval_service = EvaluationService()
+        self._agent_router = AgentRouter(identity_threshold_profile)
 
         if settings.gemini_backend == "chrome":
             # Chrome backend: connect to an already-running Chrome via CDP.
@@ -712,7 +713,7 @@ class GeminiWorker:
                 "selected": False,
                 "repair": None,
             }
-            action = self._decide_candidate_action(
+            action = self._agent_router.decide_candidate_action(
                 judgement,
                 edit_count=0,
                 identity_repairs=0,
@@ -739,7 +740,7 @@ class GeminiWorker:
         if not candidates:
             raise RuntimeError("Hero preview candidate budget exhausted before generation")
 
-        selected = self._select_candidate(candidates)
+        selected = self._agent_router.select_candidate(candidates)
         if selected is None:
             selected = candidates[-1]
 
@@ -827,7 +828,7 @@ class GeminiWorker:
                 "repair": None,
                 "regenerated_from_candidate_id": selected.get("candidate_id"),
             }
-            action = self._decide_candidate_action(
+            action = self._agent_router.decide_candidate_action(
                 judgement,
                 edit_count=0,
                 identity_repairs=0,
@@ -851,7 +852,7 @@ class GeminiWorker:
                 "regenerated_from_candidate_id": selected.get("candidate_id"),
             })
 
-            selected = self._select_candidate(candidates) or candidate
+            selected = self._agent_router.select_candidate(candidates) or candidate
 
         # Apply local edit or identity repair if needed
         selected["selected"] = True
@@ -862,7 +863,7 @@ class GeminiWorker:
         local_edit_needed = selected_action.get("action") == "LOCAL_EDIT"
         repair_needed = (
             selected_action.get("action") == "IDENTITY_REPAIR"
-            or self._should_apply_identity_repair(
+            or self._agent_router.should_apply_identity_repair(
                 selected.get("judgement", {}),
                 identity_thresholds,
             )
@@ -1053,7 +1054,7 @@ class GeminiWorker:
                 selected.get("gate_status", {}).get("hard_gates_pass")
             ),
         }
-        metadata["shortlist"] = self._candidate_shortlist(candidates, limit=2)
+        metadata["shortlist"] = self._agent_router.candidate_shortlist(candidates, limit=2)
         metadata["face_swap"] = selected["repair"]
         if selected.get("local_edit"):
             metadata["local_edit"] = selected["local_edit"]
@@ -1237,7 +1238,7 @@ class GeminiWorker:
                 "selected": False,
                 "repair": None,
             }
-            action = self._decide_candidate_action(
+            action = self._agent_router.decide_candidate_action(
                 judgement,
                 edit_count=0,
                 identity_repairs=0,
@@ -1264,7 +1265,7 @@ class GeminiWorker:
         if not candidates:
             raise RuntimeError("Initial candidate budget exhausted before generation")
 
-        selected = self._select_candidate(candidates)
+        selected = self._agent_router.select_candidate(candidates)
         if selected is None:
             # Extremely defensive fallback: start_conversation succeeded at least
             # once if candidates is non-empty, so use the last candidate rather
@@ -1354,7 +1355,7 @@ class GeminiWorker:
                 "repair": None,
                 "regenerated_from_candidate_id": selected.get("candidate_id"),
             }
-            action = self._decide_candidate_action(
+            action = self._agent_router.decide_candidate_action(
                 judgement,
                 edit_count=0,
                 identity_repairs=0,
@@ -1378,7 +1379,7 @@ class GeminiWorker:
                 "regenerated_from_candidate_id": selected.get("candidate_id"),
             })
 
-            selected = self._select_candidate(candidates) or candidate
+            selected = self._agent_router.select_candidate(candidates) or candidate
 
         if (
             selected.get("agent_action", {}).get("action")
@@ -1404,7 +1405,7 @@ class GeminiWorker:
         local_edit_needed = selected_action.get("action") == "LOCAL_EDIT"
         repair_needed = (
             selected_action.get("action") == "IDENTITY_REPAIR"
-            or self._should_apply_identity_repair(
+            or self._agent_router.should_apply_identity_repair(
                 selected.get("judgement", {}),
                 identity_thresholds,
             )
@@ -1607,7 +1608,7 @@ class GeminiWorker:
                 selected.get("gate_status", {}).get("hard_gates_pass")
             ),
         }
-        metadata["shortlist"] = self._candidate_shortlist(candidates, limit=2)
+        metadata["shortlist"] = self._agent_router.candidate_shortlist(candidates, limit=2)
         metadata["face_swap"] = selected["repair"]
         if selected.get("local_edit"):
             metadata["local_edit"] = selected["local_edit"]
@@ -1629,114 +1630,6 @@ class GeminiWorker:
         return filepath, metadata
 
     @staticmethod
-    def _decide_candidate_action(
-        judgement: dict,
-        edit_count: int = 0,
-        identity_repairs: int = 0,
-        identity_thresholds: dict | None = None,
-    ) -> dict:
-        """Bounded state-machine action for one evaluated candidate."""
-        scores = judgement.get("scores", {}) or {}
-        failures = set(judgement.get("hard_failures") or [])
-        action_hint = judgement.get("recommended_action")
-        identity = scores.get("identity")
-        style_match = scores.get("style_match")
-        artifact = scores.get("artifact")
-        thresholds = identity_thresholds or identity_threshold_profile()
-        identity_pass_threshold = float(
-            thresholds.get("identity_pass_threshold", IDENTITY_PASS_THRESHOLD)
-        )
-        identity_repair_threshold = float(
-            thresholds.get("identity_repair_threshold", IDENTITY_REPAIR_THRESHOLD)
-        )
-        gate = EvaluationService._candidate_gate_status(judgement, thresholds)
-
-        if action_hint == "discard":
-            return {
-                "action": "DROP_CANDIDATE",
-                "reason": "judge_or_local_gate_marked_discard",
-            }
-        if not gate["safety_pass"]:
-            return {"action": "DROP_CANDIDATE", "reason": "unsafe_content"}
-        if not gate["face_detected"]:
-            return {
-                "action": "REGENERATE_FROM_ORIGINAL",
-                "reason": "no_usable_face_detected",
-            }
-        if identity is None:
-            if identity_repairs < MAX_PIPELINE_IDENTITY_REPAIRS:
-                return {
-                    "action": "IDENTITY_REPAIR",
-                    "reason": "identity_unverified",
-                }
-            return {"action": "DROP_CANDIDATE", "reason": "identity_unverified"}
-        if identity < identity_repair_threshold:
-            return {
-                "action": "REGENERATE_FROM_ORIGINAL",
-                "reason": "identity_below_repair_threshold",
-            }
-        if identity < identity_pass_threshold:
-            good_composition = style_match is None or style_match >= QUALITY_ACCEPT_THRESHOLD
-            if identity_repairs < MAX_PIPELINE_IDENTITY_REPAIRS and good_composition:
-                return {
-                    "action": "IDENTITY_REPAIR",
-                    "reason": "identity_gray_zone_with_usable_composition",
-                }
-            return {
-                "action": "REGENERATE_FROM_ORIGINAL",
-                "reason": "identity_gray_zone_not_worth_repair",
-            }
-        if gate["severe_quality_fail"]:
-            return {
-                "action": "REGENERATE_FROM_ORIGINAL",
-                "reason": "global_quality_failure",
-            }
-        if (
-            artifact is not None
-            and artifact < QUALITY_ACCEPT_THRESHOLD
-            and edit_count < MAX_PIPELINE_LOCAL_EDITS
-        ):
-            return {"action": "LOCAL_EDIT", "reason": "local_artifact"}
-        if gate["hard_gates_pass"]:
-            return {"action": "ACCEPT", "reason": "all_hard_gates_pass"}
-        return {"action": "DROP_CANDIDATE", "reason": "quality_below_delivery_gate"}
-
-    @staticmethod
-    def _should_apply_identity_repair(
-        judgement: dict,
-        identity_thresholds: dict | None = None,
-    ) -> bool:
-        """Return True only for identity-gray-zone candidates worth repairing."""
-        scores = judgement.get("scores", {})
-        identity = scores.get("identity")
-        failures = set(judgement.get("hard_failures") or [])
-        action = judgement.get("recommended_action")
-        thresholds = identity_thresholds or identity_threshold_profile()
-        identity_pass_threshold = float(
-            thresholds.get("identity_pass_threshold", IDENTITY_PASS_THRESHOLD)
-        )
-        identity_repair_threshold = float(
-            thresholds.get("identity_repair_threshold", IDENTITY_REPAIR_THRESHOLD)
-        )
-
-        if identity is None:
-            # If the judge failed to score identity, prefer a repair attempt over
-            # silently accepting an unverified face.
-            return True
-        if identity < identity_repair_threshold:
-            # Below the repair threshold, the state machine should regenerate
-            # from the original Identity Pack or drop the branch. Repairing a
-            # clearly wrong face tends to lock in drift.
-            return False
-        if identity >= identity_pass_threshold:
-            return False
-        return (
-            action == "face_swap"
-            or "identity_too_low" in failures
-            or identity < identity_pass_threshold
-        )
-
-    @staticmethod
     def _public_repair_metadata(action: str, result: FaceSwapResult) -> dict:
         """Keep repair metadata useful without exposing local absolute paths."""
         return {
@@ -1749,67 +1642,43 @@ class GeminiWorker:
         }
 
     @staticmethod
+    def _decide_candidate_action(
+        judgement: dict,
+        edit_count: int = 0,
+        identity_repairs: int = 0,
+        identity_thresholds: dict | None = None,
+    ) -> dict:
+        """Bounded state-machine action for one evaluated candidate."""
+        router = AgentRouter(identity_threshold_profile)
+        return router.decide_candidate_action(
+            judgement,
+            edit_count=edit_count,
+            identity_repairs=identity_repairs,
+            identity_thresholds=identity_thresholds,
+        )
+
+    @staticmethod
+    def _should_apply_identity_repair(
+        judgement: dict,
+        identity_thresholds: dict | None = None,
+    ) -> bool:
+        """Return True only for identity-gray-zone candidates worth repairing."""
+        router = AgentRouter(identity_threshold_profile)
+        return router.should_apply_identity_repair(
+            judgement,
+            identity_thresholds=identity_thresholds,
+        )
+
+    @staticmethod
     def _select_candidate(candidates: list[dict]) -> dict | None:
-        if not candidates:
-            return None
-        deliverable = [
-            c for c in candidates
-            if c.get("gate_status", {}).get("hard_gates_pass")
-        ]
-        if deliverable:
-            return max(deliverable, key=lambda c: c.get("aggregate_score", 0.0))
-
-        locally_editable = [
-            c for c in candidates
-            if c.get("agent_action", {}).get("action") == "LOCAL_EDIT"
-        ]
-        if locally_editable:
-            return max(locally_editable, key=lambda c: c.get("aggregate_score", 0.0))
-
-        repairable = [
-            c for c in candidates
-            if c.get("agent_action", {}).get("action") == "IDENTITY_REPAIR"
-        ]
-        if repairable:
-            return max(repairable, key=lambda c: c.get("aggregate_score", 0.0))
-
-        regeneratable = [
-            c for c in candidates
-            if c.get("agent_action", {}).get("action") == "REGENERATE_FROM_ORIGINAL"
-        ]
-        if regeneratable:
-            return max(regeneratable, key=lambda c: c.get("aggregate_score", 0.0))
-
-        return max(candidates, key=lambda c: c.get("aggregate_score", 0.0))
+        router = AgentRouter(identity_threshold_profile)
+        return router.select_candidate(candidates)
 
     @staticmethod
     def _candidate_shortlist(candidates: list[dict], limit: int = 2) -> list[dict]:
         """Public candidate-funnel summary: top retained candidates, no paths."""
-        ranked = sorted(
-            candidates,
-            key=lambda c: (
-                bool(c.get("gate_status", {}).get("hard_gates_pass")),
-                c.get("aggregate_score", 0.0),
-            ),
-            reverse=True,
-        )
-        shortlist = []
-        for rank, candidate in enumerate(ranked[:limit], start=1):
-            gate = candidate.get("gate_status") or {}
-            action = candidate.get("agent_action") or {}
-            shortlist.append({
-                "rank": rank,
-                "candidate_id": candidate.get("candidate_id"),
-                "candidate_index": candidate.get("index"),
-                "filename": candidate.get("filename"),
-                "aggregate_score": candidate.get("aggregate_score"),
-                "hard_gates_pass": gate.get("hard_gates_pass"),
-                "hard_gate_failures": gate.get("hard_gate_failures", []),
-                "recommended_action": action.get("action"),
-                "action_reason": action.get("reason"),
-                "selected": bool(candidate.get("selected")),
-            })
-        return shortlist
+        router = AgentRouter(identity_threshold_profile)
+        return router.candidate_shortlist(candidates, limit=limit)
 
     # ── Iterative resemblance agent ───────────────────────────
 

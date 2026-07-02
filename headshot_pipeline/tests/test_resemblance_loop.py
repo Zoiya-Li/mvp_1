@@ -36,7 +36,7 @@ if str(_PIPELINE) not in sys.path:
     sys.path.insert(0, str(_PIPELINE))
 
 import server.gemini_worker as gemini_worker_module  # noqa: E402
-from server.evaluation import EvaluationService  # noqa: E402
+from server.evaluation import EvaluationService, AgentRouter  # noqa: E402
 from server.gemini_worker import (  # noqa: E402
     GeminiWorker,
     IDENTITY_PASS_THRESHOLD,
@@ -909,6 +909,7 @@ def _make_pipeline_worker(judge_texts, swap_result=None):
     w._face_swap_load_failed = True
     w._ensure_session = lambda *a, **k: None  # type: ignore[assignment]
     w._eval_service = EvaluationService()
+    w._agent_router = AgentRouter(identity_threshold_profile)
     w.swap_calls = 0
 
     def fake_swap(_generated_path, _photo_paths, _title):
