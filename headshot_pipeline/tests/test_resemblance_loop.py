@@ -36,6 +36,7 @@ if str(_PIPELINE) not in sys.path:
     sys.path.insert(0, str(_PIPELINE))
 
 import server.gemini_worker as gemini_worker_module  # noqa: E402
+from server.evaluation import EvaluationService  # noqa: E402
 from server.gemini_worker import (  # noqa: E402
     GeminiWorker,
     IDENTITY_PASS_THRESHOLD,
@@ -168,6 +169,7 @@ def _make_worker(judge_texts, judge_exc=None):
     w._face_swapper = None
     w._face_swap_load_failed = True  # tests have no model; skip face-swap
     w._ensure_session = lambda *a, **k: None  # type: ignore[assignment]
+    w._eval_service = EvaluationService()
     return w
 
 
@@ -177,6 +179,7 @@ def _make_loader_worker():
     w._face_swap_load_failed = False
     w._identity_app = None
     w._identity_app_load_failed = False
+    w._eval_service = EvaluationService()
     return w
 
 
@@ -307,7 +310,7 @@ def test_quality_judge_json_parse_normalizes_scores_and_action():
       "notes": "Strong candidate"
     }
     """
-    out = GeminiWorker._parse_quality_judge_response(text)
+    out = EvaluationService._parse_quality_judge_response(text)
     assert out["scores"]["identity"] == 9
     assert out["scores"]["face_quality"] == 9
     assert out["recommended_action"] == "accept"
@@ -315,7 +318,7 @@ def test_quality_judge_json_parse_normalizes_scores_and_action():
 
 
 def test_quality_judge_falls_back_to_old_score_parser():
-    out = GeminiWorker._parse_quality_judge_response("评分：7/10\n需要调整：脸型")
+    out = EvaluationService._parse_quality_judge_response("评分：7/10\n需要调整：脸型")
     assert out["scores"]["identity"] == 7
     assert out["scores"]["commercial_readiness"] == 7
     assert out["recommended_action"] == "retry"
@@ -338,7 +341,7 @@ def test_aggregate_quality_penalizes_hard_failures():
         "hard_failures": ["face_distorted"],
         "recommended_action": "retry",
     }
-    assert GeminiWorker._aggregate_quality_score(clean) > GeminiWorker._aggregate_quality_score(failed)
+    assert EvaluationService._aggregate_quality_score(clean) > EvaluationService._aggregate_quality_score(failed)
 
 
 def test_aggregate_quality_is_clamped_to_ten():
@@ -353,7 +356,7 @@ def test_aggregate_quality_is_clamped_to_ten():
         "hard_failures": [],
         "recommended_action": "accept",
     }
-    assert GeminiWorker._aggregate_quality_score(perfect) == 10.0
+    assert EvaluationService._aggregate_quality_score(perfect) == 10.0
 
 
 def test_merge_local_quality_caps_vlm_scores_and_discards_severe_failures():
@@ -379,7 +382,7 @@ def test_merge_local_quality_caps_vlm_scores_and_discards_severe_failures():
         "measurements": {"face_count": 0},
         "notes": "no_face",
     }
-    merged = GeminiWorker._merge_local_quality(judgement, local)
+    merged = EvaluationService._merge_local_quality(judgement, local)
     assert merged["scores"]["identity"] == 9
     assert merged["scores"]["face_quality"] == 3
     assert merged["scores"]["artifact"] == 6
@@ -395,11 +398,11 @@ def test_merge_local_quality_caps_vlm_scores_and_discards_severe_failures():
 
 
 def test_identity_cosine_mapping_has_acceptance_gate():
-    assert GeminiWorker._identity_cosine_to_score(0.60) == 10
-    assert GeminiWorker._identity_cosine_to_score(0.53) == 9
-    assert GeminiWorker._identity_cosine_to_score(0.46) == 8
-    assert GeminiWorker._identity_cosine_to_score(0.41) == 7
-    assert GeminiWorker._identity_cosine_to_score(0.20) == 3
+    assert EvaluationService._identity_cosine_to_score(0.60) == 10
+    assert EvaluationService._identity_cosine_to_score(0.53) == 9
+    assert EvaluationService._identity_cosine_to_score(0.46) == 8
+    assert EvaluationService._identity_cosine_to_score(0.41) == 7
+    assert EvaluationService._identity_cosine_to_score(0.20) == 3
 
 
 def test_local_identity_similarity_uses_six_identity_pack_references(monkeypatch):
@@ -422,10 +425,10 @@ def test_local_identity_similarity_uses_six_identity_pack_references(monkeypatch
             ]
 
     monkeypatch.setattr(cv2, "imread", fake_imread)
-    w = GeminiWorker.__new__(GeminiWorker)
-    w._get_identity_app = lambda: FakeIdentityApp()  # type: ignore[assignment]
+    eval_svc = EvaluationService()
+    eval_svc._get_identity_app = lambda: FakeIdentityApp()  # type: ignore[assignment]
 
-    result = w._local_identity_similarity_check(
+    result = eval_svc._local_identity_similarity_check(
         "/tmp/generated.png",
         [f"/tmp/ref_{idx}.png" for idx in range(1, 8)],
     )
@@ -457,7 +460,7 @@ def test_merge_identity_quality_caps_vlm_identity_and_requests_repair():
         "measurements": {},
         "notes": "identity_too_low",
     }
-    merged = GeminiWorker._merge_identity_quality(judgement, local_identity)
+    merged = EvaluationService._merge_identity_quality(judgement, local_identity)
     assert merged["scores"]["identity"] == 7
     assert merged["recommended_action"] == "face_swap"
     assert "identity_too_low" in merged["hard_failures"]
@@ -481,7 +484,7 @@ def test_local_image_quality_rejects_blank_image(tmp_path):
     path = tmp_path / "blank.png"
     cv2.imwrite(str(path), blank)
 
-    out = GeminiWorker._local_image_quality_check(str(path))
+    out = EvaluationService._local_image_quality_check(str(path))
     assert "no_face" in out["hard_failures"]
     assert out["scores"]["face_quality"] <= 3
 
@@ -522,7 +525,7 @@ def test_candidate_action_uses_bounded_identity_state_machine():
 
 
 def test_candidate_gate_treats_safety_as_hard_delivery_gate():
-    gate = GeminiWorker._candidate_gate_status({
+    gate = EvaluationService._candidate_gate_status({
         "scores": {
             "identity": 10,
             "face_quality": 10,
@@ -539,7 +542,7 @@ def test_candidate_gate_treats_safety_as_hard_delivery_gate():
 
 
 def test_candidate_gate_lists_all_hard_gate_failures():
-    gate = GeminiWorker._candidate_gate_status({
+    gate = EvaluationService._candidate_gate_status({
         "scores": {
             "identity": 6,
             "face_quality": 6,
@@ -601,11 +604,11 @@ def test_candidate_gate_uses_shot_specific_identity_thresholds():
         "recommended_action": "accept",
     }
 
-    closeup_gate = GeminiWorker._candidate_gate_status(
+    closeup_gate = EvaluationService._candidate_gate_status(
         judgement,
         identity_threshold_profile({"shot_id": "closeup"}),
     )
-    environmental_gate = GeminiWorker._candidate_gate_status(
+    environmental_gate = EvaluationService._candidate_gate_status(
         judgement,
         identity_threshold_profile({
             "shot_id": "environmental",
@@ -905,6 +908,7 @@ def _make_pipeline_worker(judge_texts, swap_result=None):
     w._face_swapper = None
     w._face_swap_load_failed = True
     w._ensure_session = lambda *a, **k: None  # type: ignore[assignment]
+    w._eval_service = EvaluationService()
     w.swap_calls = 0
 
     def fake_swap(_generated_path, _photo_paths, _title):

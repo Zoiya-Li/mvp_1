@@ -33,6 +33,7 @@ from .delivery_policy import (
     image_or_source_passed_final_gate,
 )
 from .gemini_worker import GeminiWorker, identity_threshold_profile
+from .evaluation import EvaluationService
 from .image_gateway import build_provider_invocation_metadata
 from .input_quality import (
     assess_reference_identity_consistency,
@@ -1677,7 +1678,7 @@ class JobQueue:
                     filepath,
                     photos,
                 )
-                revision_gate = GeminiWorker._candidate_gate_status(
+                revision_gate = EvaluationService._candidate_gate_status(
                     revision_judgement,
                     identity_threshold_profile(shot_spec),
                 )
