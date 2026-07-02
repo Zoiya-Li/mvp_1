@@ -22,9 +22,15 @@ MVP_MAX_MULTI_STYLE_COUNT = 2
 @router.post("/sessions/{session_id}/hero-preview", response_model=list[JobResponse])
 async def start_hero_preview(
     session_id: str,
+    style: str | None = None,
     state=Depends(require_owner),
 ):
-    """Start generating the hero preview portrait for a session."""
+    """Start generating the hero preview portrait for a session.
+
+    Optional ``style`` query param overrides the session's default style
+    (used for multi-style bundles where the hero preview uses the first
+    selected style before the user unlocks the full set).
+    """
     limit_generation(session_id)
     if not state.uploaded_photos:
         raise HTTPException(400, "Upload photos first")
@@ -34,7 +40,7 @@ async def start_hero_preview(
         raise HTTPException(409, "Hero preview already generated for this session")
 
     try:
-        jobs = await queue.submit_hero_preview(session_id)
+        jobs = await queue.submit_hero_preview(session_id, style_override=style)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     if not jobs:

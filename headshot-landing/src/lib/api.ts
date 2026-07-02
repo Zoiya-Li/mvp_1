@@ -259,10 +259,14 @@ function withTokenQuery(
 // ── Generation / jobs ───────────────────────────────────
 
 export async function startHeroPreview(
-  sessionId: string
+  sessionId: string,
+  style?: StyleKey
 ): Promise<JobResponse[]> {
+  const url = style
+    ? `/sessions/${sessionId}/hero-preview?style=${encodeURIComponent(style)}`
+    : `/sessions/${sessionId}/hero-preview`;
   return asJson(
-    apiFetch(`/sessions/${sessionId}/hero-preview`, { method: "POST", sessionId }),
+    apiFetch(url, { method: "POST", sessionId }),
     "POST /hero-preview"
   );
 }

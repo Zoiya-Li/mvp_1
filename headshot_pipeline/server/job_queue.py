@@ -1221,8 +1221,12 @@ class JobQueue:
 
     # ── Job submission ────────────────────────────────
 
-    async def submit_hero_preview(self, session_id: str) -> list[Job]:
-        """Create a hero preview job: one close-up portrait for the Aha Moment."""
+    async def submit_hero_preview(self, session_id: str, style_override: str | None = None) -> list[Job]:
+        """Create a hero preview job: one close-up portrait for the Aha Moment.
+
+        ``style_override`` lets multi-style bundles pick the first selected style
+        for the hero preview instead of the session's default style.
+        """
         async with self._lock_for(session_id):
             state = self._sessions.get(session_id)
             if state is None:
@@ -1236,9 +1240,10 @@ class JobQueue:
                     + "; ".join(gate.get("issues", [])[:8])
                 )
 
-            style_data = self._prompts_data["styles"][state.style.value]
+            style_key = style_override if style_override else state.style.value
+            style_data = self._prompts_data["styles"][style_key]
             plan = build_style_shot_plan(
-                state.style.value,
+                style_key,
                 state.gender,
                 style_data,
                 hero_only=True,

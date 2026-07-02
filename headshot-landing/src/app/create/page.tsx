@@ -316,10 +316,11 @@ export default function CreatePage() {
         );
         setSession(updated);
 
-        // Multi-style: skip hero preview, go straight to full generation
-        const genJobs = await startMultiStyleGeneration(sess.session_id, styles);
-        setJobs(genJobs);
-        setStep("full_set_generating");
+        // Multi-style: still generate a hero preview with the first selected style
+        // so the user gets an Aha Moment before deciding to unlock the full bundle.
+        const heroJobs = await startHeroPreview(sess.session_id, styles[0]);
+        setJobs(heroJobs);
+        setStep("hero_generating");
       } catch (e) {
         setError(e instanceof Error ? e.message : "Something went wrong");
       }
