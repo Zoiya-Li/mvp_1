@@ -81,15 +81,17 @@ class EvaluationService:
 
     def judge_current_candidate(
         self,
-        client,
+        gateway,
         image_path: str | None = None,
         reference_photo_paths: list[str] | None = None,
     ) -> dict:
         """Ask the model for structured QA and return a normalized dict."""
         try:
-            response_text = client.converse_text(
-                QUALITY_JUDGE_PROMPT,
-                timeout=client.timeout if hasattr(client, "timeout") else 180,
+            response_text = gateway.judge(
+                current_image_path=image_path or "",
+                reference_paths=reference_photo_paths or [],
+                judge_prompt=QUALITY_JUDGE_PROMPT,
+                timeout=180,
             )
             judgement = self._parse_quality_judge_response(response_text)
             judgement["raw_response"] = response_text

@@ -47,6 +47,7 @@ from server.gemini_worker import (  # noqa: E402
     build_shot_spec_metadata,
     identity_threshold_profile,
 )
+from server.repair import FaceSwapRepair  # noqa: E402
 from server.models import (  # noqa: E402
     AgentAction,
     Candidate,
@@ -131,11 +132,10 @@ def test_parse_feedback_fulltext_fallback_when_low_score_no_keyword():
 # ──────────────────────────────────────────────────────────────────────
 
 class FakeClient:
-    """Stand-in for OpenRouterGeminiClient. Records every call.
+    """Stand-in for an ImageProvider. Records every call.
 
-    Implements the same drop-in surface the worker calls (start_conversation /
-    converse_text / converse), so the loop control flow is exercised against
-    the real worker with NO network and NO API key.
+    Implements the ImageProvider surface so the loop control flow is exercised
+    against the real worker with NO network and NO API key.
     """
 
     def __init__(self, judge_texts: list[str], judge_exc: Exception | None = None):
@@ -145,38 +145,51 @@ class FakeClient:
         self.converse_calls = 0
         self.judge_calls = 0
 
-    def start_conversation(self, prompt, photo_paths, title, template_path=None, editing_mode=False):
+    def create_from_references(self, prompt, reference_paths, template_path, title, editing_mode=True):
         self.start_calls += 1
         return "/tmp/fake_initial.png"
 
-    def converse_text(self, prompt, timeout=60):
+    def local_edit(self, current_image_path, reference_paths, edit_prompt, title):
+        self.converse_calls += 1
+        return f"/tmp/fake_iter_{self.converse_calls}.png"
+
+    def judge(self, current_image_path, reference_paths, judge_prompt, timeout=None):
         self.judge_calls += 1
         if self.judge_exc is not None:
             raise self.judge_exc
         return self._judge_texts.pop(0)
 
-    def converse(self, prompt, title, turn_number):
-        self.converse_calls += 1
-        return f"/tmp/fake_iter_{turn_number}.png"
+    def upscale(self, image_path):
+        return image_path
+
+    def end_session(self):
+        pass
 
 
 def _make_worker(judge_texts, judge_exc=None):
     """Build a GeminiWorker WITHOUT connecting to Chrome (skip __init__)."""
     w = GeminiWorker.__new__(GeminiWorker)
-    w.client = FakeClient(judge_texts, judge_exc=judge_exc)
     w.active_session_id = None
     w._turn_counts = {}
-    w._face_swapper = None
-    w._face_swap_load_failed = True  # tests have no model; skip face-swap
-    w._ensure_session = lambda *a, **k: None  # type: ignore[assignment]
     w._eval_service = EvaluationService()
+    w._agent_router = AgentRouter(identity_threshold_profile)
+    w._face_swap_repair = FaceSwapRepair()
+    w._face_swap_repair._load_failed = True  # tests have no model; skip face-swap
+    # Build a minimal gateway that routes to our FakeClient
+    from server.generation.gateway import ImageGateway
+    gw = ImageGateway.__new__(ImageGateway)
+    fake_provider = FakeClient(judge_texts, judge_exc=judge_exc)
+    gw._openrouter = fake_provider
+    gw._chrome = None
+    w._gateway = gw
+    w._ensure_session = lambda *a, **k: None  # type: ignore[assignment]
     return w
 
 
 def _make_loader_worker():
     w = GeminiWorker.__new__(GeminiWorker)
-    w._face_swapper = None
-    w._face_swap_load_failed = False
+    w._face_swap_repair = FaceSwapRepair()
+    w._face_swap_repair._load_failed = False
     w._identity_app = None
     w._identity_app_load_failed = False
     w._eval_service = EvaluationService()
@@ -192,31 +205,38 @@ def test_face_swapper_lazy_loader_loads_and_caches_model(tmp_path, monkeypatch):
         def __init__(self, path):
             loaded_paths.append(path)
 
-    monkeypatch.setattr(gemini_worker_module.settings, "face_swap_enabled", True)
-    monkeypatch.setattr(gemini_worker_module.settings, "face_swap_model_path", model_path)
-    monkeypatch.setattr(gemini_worker_module, "FaceSwapper", FakeFaceSwapper)
-    w = _make_loader_worker()
+    import server.repair.identity_repair as repair_module
 
-    first = w._get_face_swapper()
-    second = w._get_face_swapper()
+    monkeypatch.setattr(repair_module.settings, "face_swap_enabled", True)
+    monkeypatch.setattr(repair_module.settings, "face_swap_model_path", model_path)
+    monkeypatch.setattr(repair_module, "FaceSwapper", FakeFaceSwapper)
+
+    from server.repair import FaceSwapRepair
+
+    repair = FaceSwapRepair()
+    first = repair._get_swapper()
+    second = repair._get_swapper()
 
     assert isinstance(first, FakeFaceSwapper)
     assert second is first
     assert loaded_paths == [model_path]
-    assert w._face_swap_load_failed is False
+    assert repair._load_failed is False
 
 
 def test_face_swapper_lazy_loader_marks_missing_model_unavailable(tmp_path, monkeypatch):
-    monkeypatch.setattr(gemini_worker_module.settings, "face_swap_enabled", True)
+    import server.repair.identity_repair as repair_module
+
+    monkeypatch.setattr(repair_module.settings, "face_swap_enabled", True)
     monkeypatch.setattr(
-        gemini_worker_module.settings,
+        repair_module.settings,
         "face_swap_model_path",
         tmp_path / "missing.onnx",
     )
-    w = _make_loader_worker()
+    from server.repair import FaceSwapRepair
 
-    assert w._get_face_swapper() is None
-    assert w._face_swap_load_failed is True
+    repair = FaceSwapRepair()
+    assert repair._get_swapper() is None
+    assert repair._load_failed is True
 
 
 def test_loop_accepts_fast_when_score_meets_threshold():
@@ -228,8 +248,8 @@ def test_loop_accepts_fast_when_score_meets_threshold():
     assert meta["final_score"] == 9
     assert meta["history"][0]["accepted"] is True
     # Accepted on first judge → NO revision turn should be requested.
-    assert w.client.converse_calls == 0
-    assert w.client.judge_calls == 1
+    assert w._gateway._provider_for("CREATE_FROM_REFERENCES").converse_calls == 0
+    assert w._gateway._provider_for("CREATE_FROM_REFERENCES").judge_calls == 1
 
 
 def test_loop_revises_then_accepts():
@@ -241,8 +261,8 @@ def test_loop_revises_then_accepts():
     assert meta["final_score"] == 8
     assert meta["history"][1]["accepted"] is True
     assert meta["history"][0]["accepted"] is False   # iter 1 was a revise
-    assert w.client.converse_calls == 1              # exactly one revision
-    assert w.client.judge_calls == 2
+    assert w._gateway._provider_for("CREATE_FROM_REFERENCES").converse_calls == 1              # exactly one revision
+    assert w._gateway._provider_for("CREATE_FROM_REFERENCES").judge_calls == 2
 
 
 def test_loop_reaches_max_iterations_and_accepts_last():
@@ -260,8 +280,8 @@ def test_loop_reaches_max_iterations_and_accepts_last():
     # The final iteration must be accepted (max_reached), and it must NOT have
     # requested another revision (i>=MAX breaks before the revise branch).
     assert meta["history"][-1]["accepted"] is True
-    assert w.client.converse_calls == MAX_RESEMBLANCE_ITERATIONS - 1  # 2
-    assert w.client.judge_calls == MAX_RESEMBLANCE_ITERATIONS         # 3
+    assert w._gateway._provider_for("CREATE_FROM_REFERENCES").converse_calls == MAX_RESEMBLANCE_ITERATIONS - 1  # 2
+    assert w._gateway._provider_for("CREATE_FROM_REFERENCES").judge_calls == MAX_RESEMBLANCE_ITERATIONS         # 3
 
 
 def test_loop_retries_fast_judge_failure_then_accepts_current():
@@ -280,8 +300,8 @@ def test_loop_retries_fast_judge_failure_then_accepts_current():
     assert meta["final_score"] is None
     assert meta["history"][0]["accepted"] is True
     assert meta["history"][0]["error"] is not None
-    assert w.client.converse_calls == 0
-    assert w.client.judge_calls == 2   # fast failure retried once
+    assert w._gateway._provider_for("CREATE_FROM_REFERENCES").converse_calls == 0
+    assert w._gateway._provider_for("CREATE_FROM_REFERENCES").judge_calls == 2   # fast failure retried once
 
 
 def test_threshold_constant_is_8():
@@ -876,6 +896,8 @@ def test_pipeline_contract_models_validate_worker_metadata():
 
 
 class FakePipelineClient:
+    """ImageProvider-compatible fake for pipeline tests."""
+
     def __init__(self, judge_texts: list[str]):
         self._judge_texts = list(judge_texts)
         self.start_calls = 0
@@ -884,39 +906,53 @@ class FakePipelineClient:
         self._last_image_path = None
         self.photo_counts = []
 
-    def start_conversation(self, prompt, photo_paths, title, template_path=None, editing_mode=False):
+    def create_from_references(self, prompt, reference_paths, template_path, title, editing_mode=True):
         self.start_calls += 1
-        self.photo_counts.append(len(photo_paths))
+        self.photo_counts.append(len(reference_paths))
         self._last_image_path = f"/tmp/{title}.png"
         return self._last_image_path
 
-    def converse_text(self, prompt, timeout=60):
-        self.judge_calls += 1
-        return self._judge_texts.pop(0)
-
-    def converse(self, prompt, title=None, turn_number=None):
+    def local_edit(self, current_image_path, reference_paths, edit_prompt, title):
         self.converse_calls += 1
         self._last_image_path = f"/tmp/{title}.png"
         return self._last_image_path
 
+    def judge(self, current_image_path, reference_paths, judge_prompt, timeout=None):
+        self.judge_calls += 1
+        return self._judge_texts.pop(0)
+
+    def upscale(self, image_path):
+        return image_path
+
+    def end_session(self):
+        pass
+
 
 def _make_pipeline_worker(judge_texts, swap_result=None):
     w = GeminiWorker.__new__(GeminiWorker)
-    w.client = FakePipelineClient(judge_texts)
     w.active_session_id = None
     w._turn_counts = {}
-    w._face_swapper = None
-    w._face_swap_load_failed = True
+    w._face_swap_repair = FaceSwapRepair()
+    w._face_swap_repair._load_failed = True
     w._ensure_session = lambda *a, **k: None  # type: ignore[assignment]
     w._eval_service = EvaluationService()
     w._agent_router = AgentRouter(identity_threshold_profile)
     w.swap_calls = 0
 
+    # Build gateway with FakePipelineClient
+    from server.generation.gateway import ImageGateway
+    gw = ImageGateway.__new__(ImageGateway)
+    fake_provider = FakePipelineClient(judge_texts)
+    gw._openrouter = fake_provider
+    gw._chrome = None
+    w._gateway = gw
+
     def fake_swap(_generated_path, _photo_paths, _title):
         w.swap_calls += 1
         if swap_result is not None:
             return swap_result
-        return SimpleNamespace(
+        from server.repair.identity_repair import FaceSwapResult
+        return FaceSwapResult(
             output_path=Path("/tmp/not_swapped.png"),
             swapped=False,
             message="not needed",
@@ -964,8 +1000,8 @@ def test_quality_pipeline_skips_face_swap_for_high_identity_candidate():
     _fp, meta = w.execute_generate_with_quality_pipeline(
         "s1", "prompt", ["a.jpg"], "title", template_path=None
     )
-    assert w.client.start_calls == 3
-    assert w.client.judge_calls == 3
+    assert w._gateway._provider_for("CREATE_FROM_REFERENCES").start_calls == 3
+    assert w._gateway._provider_for("CREATE_FROM_REFERENCES").judge_calls == 3
     assert w.swap_calls == 0
     assert meta["pipeline"] == "controlled_candidate_v2"
     assert meta["budget"]["initial_candidates"] == 3
@@ -1005,8 +1041,8 @@ def test_quality_pipeline_budget_stops_initial_candidate_generation(monkeypatch)
         "s_budget", "prompt", ["a.jpg"], "title", template_path=None
     )
 
-    assert w.client.start_calls == 1
-    assert w.client.judge_calls == 1
+    assert w._gateway._provider_for("CREATE_FROM_REFERENCES").start_calls == 1
+    assert w._gateway._provider_for("CREATE_FROM_REFERENCES").judge_calls == 1
     assert len(meta["candidates"]) == 1
     assert len(meta["provider_invocations"]) == 1
     assert meta["budget"]["initial_candidates"] == 3
@@ -1032,7 +1068,7 @@ def test_quality_pipeline_keeps_six_reference_identity_pack_but_generates_with_f
         template_path=None,
     )
 
-    assert w.client.photo_counts == [4, 4, 4]
+    assert w._gateway._provider_for("CREATE_FROM_REFERENCES").photo_counts == [4, 4, 4]
     assert [
         ref["role"]
         for ref in meta["identity_pack"]["reference_images"]
@@ -1093,8 +1129,8 @@ def test_quality_pipeline_executes_regenerate_from_original_once():
     )
 
     assert fp == "/tmp/title_regen1.png"
-    assert w.client.start_calls == 4
-    assert w.client.judge_calls == 4
+    assert w._gateway._provider_for("CREATE_FROM_REFERENCES").start_calls == 4
+    assert w._gateway._provider_for("CREATE_FROM_REFERENCES").judge_calls == 4
     assert meta["budget"]["regenerations_used"] == 1
     assert meta["budget"]["estimated_cost_used"] == 0.48
     assert meta["selected_candidate"]["candidate_id"] == "cand_4"
@@ -1127,7 +1163,7 @@ def test_quality_pipeline_does_not_identity_repair_below_repair_threshold():
         "s_regen_fail", "prompt", ["a.jpg"], "title", template_path=None
     )
 
-    assert w.client.start_calls == 5
+    assert w._gateway._provider_for("CREATE_FROM_REFERENCES").start_calls == 5
     assert w.swap_calls == 0
     assert meta["budget"]["regenerations_used"] == 2
     assert meta["budget"]["identity_repairs_used"] == 0
@@ -1166,7 +1202,7 @@ def test_quality_pipeline_repairs_gray_zone_identity_candidate_and_rescores():
     )
     assert fp == "/tmp/swapped.png"
     assert w.swap_calls == 1
-    assert w.client.judge_calls == 4
+    assert w._gateway._provider_for("CREATE_FROM_REFERENCES").judge_calls == 4
     assert meta["budget"]["identity_repairs_used"] == 1
     assert any(
         action["action"] == "IDENTITY_REPAIR"
@@ -1194,9 +1230,9 @@ def test_quality_pipeline_local_edits_artifact_candidate_and_rescores():
     )
 
     assert fp == "/tmp/title_cand1_local_edit.png"
-    assert w.client.start_calls == 3
-    assert w.client.converse_calls == 1
-    assert w.client.judge_calls == 4
+    assert w._gateway._provider_for("CREATE_FROM_REFERENCES").start_calls == 3
+    assert w._gateway._provider_for("CREATE_FROM_REFERENCES").converse_calls == 1
+    assert w._gateway._provider_for("CREATE_FROM_REFERENCES").judge_calls == 4
     assert meta["budget"]["local_edits_used"] == 1
     assert meta["local_edit"]["applied"] is True
     assert meta["local_edit"]["output_filename"] == "title_cand1_local_edit.png"
@@ -1227,7 +1263,7 @@ def test_quality_pipeline_drops_candidate_when_local_edit_still_fails_gate():
     )
 
     assert fp == "/tmp/title_cand1_local_edit.png"
-    assert w.client.converse_calls == 1
+    assert w._gateway._provider_for("CREATE_FROM_REFERENCES").converse_calls == 1
     assert meta["budget"]["local_edits_used"] == 1
     assert meta["local_edit"]["applied"] is True
     assert meta["selected_candidate"]["deliverable"] is False

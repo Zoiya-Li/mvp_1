@@ -1,15 +1,10 @@
 """Gemini worker — adapts the Gemini client for the job queue.
 
-Tracks which session currently "owns" the Gemini conversation and handles
+Tracks which session currently "owns" the generation pipeline and handles
 switching between sessions (end old → start new).
 
-Generation backend: the OpenRouter REST API (server/openrouter_client.py),
-driving ``gemini-3.1-flash-image-preview`` ("Nano Banana 2") directly. This
-replaced the headless-Chrome driver (persistent_client.py) — the Chrome path
-was the single biggest source of "needs constant debugging" (login expiry,
-DOM-selector drift, VNC re-login, profile locks). The resemblance loop below is
-unchanged: it calls start_conversation / converse_text / converse /
-end_conversation, all of which the API client provides as a drop-in.
+Generation backend is now abstracted through ImageGateway; business code
+no longer directly calls OpenRouter or Chrome client methods.
 """
 
 from __future__ import annotations
@@ -22,9 +17,10 @@ from pathlib import Path
 
 from .config import settings
 from .evaluation import EvaluationService, AgentRouter
-from .face_swap import FaceSwapper, FaceSwapResult
+from .generation import ImageGateway
 from .image_gateway import build_provider_invocation_metadata, estimate_cost
 from .models import IdentityPack, ShotSpec
+from .repair import FaceSwapRepair, public_repair_metadata
 
 # ── Resemblance Agent Constants ───────────────────────────
 
@@ -399,128 +395,34 @@ def build_shot_spec_metadata(prompt: str, title: str, template_path: str | None)
 
 
 class GeminiWorker:
-    """Wraps the OpenRouter Gemini client with session-aware conversation management."""
+    """Wraps the image-generation gateway with session-aware pipeline management."""
 
     def __init__(self):
         self.active_session_id: str | None = None
         self._turn_counts: dict[str, int] = {}
-        # Lazy-loaded in the worker thread to avoid blocking the event loop.
-        self._face_swapper: FaceSwapper | None = None
-        self._face_swap_load_failed: bool = False
         self._eval_service = EvaluationService()
         self._agent_router = AgentRouter(identity_threshold_profile)
-
-        if settings.gemini_backend == "chrome":
-            # Chrome backend: connect to an already-running Chrome via CDP.
-            # The Chrome instance must have been started with
-            #   python persistent_client.py launch
-            # and the user must be logged in to gemini.google.com.
-            from persistent_client import PersistentGeminiClient
-
-            self.client = PersistentGeminiClient(
-                port=settings.chrome_cdp_port,
-                output_dir=str(settings.output_dir),
-                wait_timeout=settings.chrome_wait_timeout,
-            )
-            return
-
-        # OpenRouter backend (default production path).
-        from .openrouter_client import OpenRouterGeminiClient, OpenRouterError
-
-        if not settings.openrouter_api_key:
-            # Hard-fail construction with a clear, actionable message. The API
-            # path has NO logged-in browser session to fall back on, unlike the
-            # old Chrome path — so an empty key must not silently produce a
-            # worker that queues-then-fails every job. The job_queue start()
-            # catches this and logs a single warning.
-            raise OpenRouterError(
-                "OPENROUTER_API_KEY is not set and gemini_backend is openrouter. "
-                "Add OPENROUTER_API_KEY=<your key> to .env, or set "
-                "GEMINI_BACKEND=chrome to use a logged-in Chrome instead."
-            )
-
-        self.client = OpenRouterGeminiClient(
-            api_key=settings.openrouter_api_key,
-            output_dir=str(settings.output_dir),
-            model=settings.gemini_model,
-            base_url=settings.openrouter_base_url,
-            timeout=settings.gemini_wait_timeout,
-        )
+        self._face_swap_repair = FaceSwapRepair()
+        self._gateway = ImageGateway()
 
     def connect(self):
-        """Validate the API key is set. Called during startup (no socket to open)."""
-        self.client.connect()
+        """Validate the provider is ready. Called during startup."""
+        self._gateway.end_session()
 
     def disconnect(self):
-        """No-op. The API has no persistent connection to close."""
-        self.client.disconnect()
+        """Clean up provider state."""
+        self._gateway.end_session()
 
-    # ── Face-swap post-processing ─────────────────────────────
-
-    def _get_face_swapper(self) -> FaceSwapper | None:
-        """Lazy-load the InsightFace face-swap model in the worker thread."""
-        if not settings.face_swap_enabled:
-            return None
-        if self._face_swapper is not None:
-            return self._face_swapper
-        if self._face_swap_load_failed:
-            return None
-
-        model_path = settings.face_swap_model_path
-        if not model_path.exists():
-            print(f"⚠ Face-swap model not found at {model_path}; skipping.")
-            self._face_swap_load_failed = True
-            return None
-
-        try:
-            print(f"Loading face-swap model from {model_path}...")
-            self._face_swapper = FaceSwapper(model_path)
-            print("✓ Face-swap model loaded")
-            return self._face_swapper
-        except Exception as exc:
-            print(f"⚠ Failed to load face-swap model: {exc}")
-            self._face_swap_load_failed = True
-            return None
+    # ── Face-swap post-processing (delegated to repair module) ──
 
     def _apply_face_swap(
         self,
         generated_path: str,
         photo_paths: list[str],
         title: str,
-    ) -> FaceSwapResult:
-        """Swap the user's face onto the generated portrait.
-
-        Falls back to the original image if the model is unavailable or no faces
-        are detected. The swapped image is written next to the generated image.
-        """
-        swapper = self._get_face_swapper()
-        if swapper is None:
-            return FaceSwapResult(
-                output_path=Path(generated_path),
-                swapped=False,
-                message="Face swap disabled or model unavailable",
-            )
-
-        generated = Path(generated_path)
-        output_path = generated.with_name(f"{generated.stem}_swapped{generated.suffix}")
-        try:
-            result = swapper.swap(
-                user_photos=photo_paths,
-                style_image=generated_path,
-                output_path=output_path,
-            )
-            if result.swapped:
-                print(f"✓ Face-swapped result saved to {result.output_path}")
-            else:
-                print(f"⚠ Face swap skipped: {result.message}")
-            return result
-        except Exception as exc:
-            print(f"⚠ Face swap failed: {exc}")
-            return FaceSwapResult(
-                output_path=generated,
-                swapped=False,
-                message=f"Face swap failed: {exc}",
-            )
+    ):
+        """Swap the user's face onto the generated portrait."""
+        return self._face_swap_repair.apply(generated_path, photo_paths, title)
 
     # ── Single-shot generation (legacy, kept for fallback) ────
 
@@ -533,16 +435,15 @@ class GeminiWorker:
         template_path: str | None = None,
     ) -> str:
         """Run a generation job. Returns path to saved image."""
-        # Switch conversation if needed
         self._ensure_session(session_id, photo_path)
 
         self._turn_counts[session_id] = 1
         wrapped_prompt = build_editing_prompt(prompt, num_user_photos=1)
-        filepath = self.client.start_conversation(
+        filepath = self._gateway.create_from_references(
             prompt=wrapped_prompt,
-            photo_paths=[photo_path],
-            title=title,
+            reference_paths=[photo_path],
             template_path=template_path,
+            title=title,
             editing_mode=True,
         )
         return filepath
@@ -666,11 +567,11 @@ class GeminiWorker:
                 prompt, len(ref_photos), idx, candidate_count
             )
             started_at = time.time()
-            filepath = self.client.start_conversation(
+            filepath = self._gateway.create_from_references(
                 prompt=candidate_prompt,
-                photo_paths=ref_photos,
-                title=f"{title}_hero_cand{idx}",
+                reference_paths=ref_photos,
                 template_path=template_path,
+                title=f"{title}_hero_cand{idx}",
                 editing_mode=True,
             )
             invocation = build_provider_invocation_metadata(
@@ -697,7 +598,7 @@ class GeminiWorker:
                     f"Quality scoring hero preview {idx}/{candidate_count}…",
                 )
 
-            judgement = self._eval_service.judge_current_candidate(self.client, filepath, eval_ref_photos)
+            judgement = self._eval_service.judge_current_candidate(self._gateway, filepath, eval_ref_photos)
             candidate = {
                 "index": idx,
                 "candidate_id": f"hero_cand_{idx}",
@@ -786,11 +687,11 @@ class GeminiWorker:
                 prompt, len(ref_photos), idx, max_steps
             )
             started_at = time.time()
-            filepath = self.client.start_conversation(
+            filepath = self._gateway.create_from_references(
                 prompt=candidate_prompt,
-                photo_paths=ref_photos,
-                title=f"{title}_hero_regen{regen_no}",
+                reference_paths=ref_photos,
                 template_path=template_path,
+                title=f"{title}_hero_regen{regen_no}",
                 editing_mode=True,
             )
             invocation = build_provider_invocation_metadata(
@@ -811,7 +712,7 @@ class GeminiWorker:
                 metadata["budget"]["estimated_cost_used"] + regen_cost, 4
             )
 
-            judgement = self._eval_service.judge_current_candidate(self.client, filepath, eval_ref_photos)
+            judgement = self._eval_service.judge_current_candidate(self._gateway, filepath, eval_ref_photos)
             candidate = {
                 "index": idx,
                 "candidate_id": f"hero_cand_{idx}",
@@ -891,13 +792,12 @@ class GeminiWorker:
                 <= metadata["budget"]["max_total_api_cost"]
             ):
                 started_at = time.time()
-                if hasattr(self.client, "_last_image_path"):
-                    self.client._last_image_path = filepath
                 edit_prompt = build_local_edit_prompt(selected.get("judgement", {}))
-                edited_path = self.client.converse(
-                    edit_prompt,
+                edited_path = self._gateway.local_edit(
+                    current_image_path=filepath,
+                    reference_paths=ref_photos,
+                    edit_prompt=edit_prompt,
                     title=f"{title}_hero_cand{selected['index']}_local_edit",
-                    turn_number=2,
                 )
                 filepath = edited_path
                 metadata["budget"]["local_edits_used"] += 1
@@ -918,7 +818,7 @@ class GeminiWorker:
                 metadata["budget"]["estimated_cost_used"] = round(
                     metadata["budget"]["estimated_cost_used"] + local_edit_cost, 4
                 )
-                edited_judgement = self._eval_service.judge_current_candidate(self.client, 
+                edited_judgement = self._eval_service.judge_current_candidate(self._gateway, 
                     filepath,
                     eval_ref_photos,
                 )
@@ -969,9 +869,7 @@ class GeminiWorker:
                     + repair_invocation["estimated_cost"],
                     4,
                 )
-                if hasattr(self.client, "_last_image_path"):
-                    self.client._last_image_path = filepath
-                repaired_judgement = self._eval_service.judge_current_candidate(self.client, 
+                repaired_judgement = self._eval_service.judge_current_candidate(self._gateway, 
                     filepath,
                     eval_ref_photos,
                 )
@@ -1191,11 +1089,11 @@ class GeminiWorker:
                 prompt, len(ref_photos), idx, candidate_count
             )
             started_at = time.time()
-            filepath = self.client.start_conversation(
+            filepath = self._gateway.create_from_references(
                 prompt=candidate_prompt,
-                photo_paths=ref_photos,
-                title=f"{title}_cand{idx}",
+                reference_paths=ref_photos,
                 template_path=template_path,
+                title=f"{title}_cand{idx}",
                 editing_mode=True,
             )
             invocation = build_provider_invocation_metadata(
@@ -1222,7 +1120,7 @@ class GeminiWorker:
                     f"Quality scoring candidate {idx}/{candidate_count}…",
                 )
 
-            judgement = self._eval_service.judge_current_candidate(self.client, filepath, eval_ref_photos)
+            judgement = self._eval_service.judge_current_candidate(self._gateway, filepath, eval_ref_photos)
             candidate = {
                 "index": idx,
                 "candidate_id": f"cand_{idx}",
@@ -1313,11 +1211,11 @@ class GeminiWorker:
                 prompt, len(ref_photos), idx, max_steps
             )
             started_at = time.time()
-            filepath = self.client.start_conversation(
+            filepath = self._gateway.create_from_references(
                 prompt=candidate_prompt,
-                photo_paths=ref_photos,
-                title=f"{title}_regen{regen_no}",
+                reference_paths=ref_photos,
                 template_path=template_path,
+                title=f"{title}_regen{regen_no}",
                 editing_mode=True,
             )
             invocation = build_provider_invocation_metadata(
@@ -1338,7 +1236,7 @@ class GeminiWorker:
                 metadata["budget"]["estimated_cost_used"] + regen_cost, 4
             )
 
-            judgement = self._eval_service.judge_current_candidate(self.client, filepath, eval_ref_photos)
+            judgement = self._eval_service.judge_current_candidate(self._gateway, filepath, eval_ref_photos)
             candidate = {
                 "index": idx,
                 "candidate_id": f"cand_{idx}",
@@ -1440,13 +1338,12 @@ class GeminiWorker:
 
         if local_edit_needed:
             started_at = time.time()
-            if hasattr(self.client, "_last_image_path"):
-                self.client._last_image_path = filepath
             edit_prompt = build_local_edit_prompt(selected.get("judgement", {}))
-            edited_path = self.client.converse(
-                edit_prompt,
+            edited_path = self._gateway.local_edit(
+                current_image_path=filepath,
+                reference_paths=ref_photos,
+                edit_prompt=edit_prompt,
                 title=f"{title}_cand{selected['index']}_local_edit",
-                turn_number=2,
             )
             filepath = edited_path
             metadata["budget"]["local_edits_used"] += 1
@@ -1467,7 +1364,7 @@ class GeminiWorker:
             metadata["budget"]["estimated_cost_used"] = round(
                 metadata["budget"]["estimated_cost_used"] + local_edit_cost, 4
             )
-            edited_judgement = self._eval_service.judge_current_candidate(self.client, 
+            edited_judgement = self._eval_service.judge_current_candidate(self._gateway, 
                 filepath,
                 eval_ref_photos,
             )
@@ -1521,11 +1418,8 @@ class GeminiWorker:
                     + repair_invocation["estimated_cost"],
                     4,
                 )
-                # Re-score the repaired image when possible. The client judge
-                # reads _last_image_path, so point it at the repaired artifact.
-                if hasattr(self.client, "_last_image_path"):
-                    self.client._last_image_path = filepath
-                repaired_judgement = self._eval_service.judge_current_candidate(self.client, 
+                # Re-score the repaired image when possible.
+                repaired_judgement = self._eval_service.judge_current_candidate(self._gateway, 
                     filepath,
                     eval_ref_photos,
                 )
@@ -1722,11 +1616,11 @@ class GeminiWorker:
             progress_callback(0, MAX_RESEMBLANCE_ITERATIONS, "generating", "Initial generation…")
 
         wrapped_prompt = build_editing_prompt(prompt, num_user_photos=len(ref_photos))
-        filepath = self.client.start_conversation(
+        filepath = self._gateway.create_from_references(
             prompt=wrapped_prompt,
-            photo_paths=ref_photos,
-            title=f"{title}_initial",
+            reference_paths=ref_photos,
             template_path=template_path,
+            title=f"{title}_initial",
             editing_mode=True,
         )
 
@@ -1763,8 +1657,10 @@ class GeminiWorker:
             for attempt in (1, 2):
                 t0 = time.time()
                 try:
-                    response_text = self.client.converse_text(
-                        RESEMBLANCE_JUDGE_PROMPT,
+                    response_text = self._gateway.judge(
+                        current_image_path=filepath,
+                        reference_paths=ref_photos,
+                        judge_prompt=RESEMBLANCE_JUDGE_PROMPT,
                         timeout=judge_timeout,
                     )
                     judge_error = None
@@ -1851,10 +1747,11 @@ class GeminiWorker:
             turn = self._turn_counts.get(session_id, 1) + 1
             self._turn_counts[session_id] = turn
 
-            filepath = self.client.converse(
-                prompt=revision_instruction,
+            filepath = self._gateway.local_edit(
+                current_image_path=filepath,
+                reference_paths=ref_photos,
+                edit_prompt=revision_instruction,
                 title=f"{title}_iter{i}",
-                turn_number=turn,
             )
 
         # Post-process with dedicated face-swap model to harden identity
@@ -1976,10 +1873,11 @@ class GeminiWorker:
         turn = self._turn_counts.get(session_id, 1) + 1
         self._turn_counts[session_id] = turn
 
-        filepath = self.client.converse(
-            prompt=instruction,
+        filepath = self._gateway.local_edit(
+            current_image_path=filepath,
+            reference_paths=[],
+            edit_prompt=instruction,
             title=title,
-            turn_number=turn,
         )
         return filepath
 
@@ -1987,24 +1885,21 @@ class GeminiWorker:
         """End the conversation for a session."""
         if self.active_session_id == session_id:
             try:
-                self.client.end_conversation()
+                self._gateway.end_session()
             except Exception:
                 pass
             self.active_session_id = None
 
     def _ensure_session(self, session_id: str, photo_path: str = ""):
-        """Make sure the Gemini conversation is for the given session."""
+        """Make sure the generation pipeline is for the given session."""
         if self.active_session_id == session_id:
             return  # already in the right session
 
         # End old session if any
         if self.active_session_id is not None:
             try:
-                self.client.end_conversation()
+                self._gateway.end_session()
             except Exception:
                 pass
-            # Open fresh chat
-            self.client.ensure_gemini_page()
-            self.client._new_chat()
 
         self.active_session_id = session_id

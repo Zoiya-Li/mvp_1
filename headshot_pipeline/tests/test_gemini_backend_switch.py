@@ -6,7 +6,7 @@ import pytest
 
 from server.config import settings
 from server.gemini_worker import GeminiWorker
-from server.openrouter_client import OpenRouterGeminiClient
+from server.openrouter_client import OpenRouterError
 
 
 def test_default_backend_is_openrouter():
@@ -15,19 +15,23 @@ def test_default_backend_is_openrouter():
     assert settings.gemini_backend in ("openrouter", "chrome")
 
 
-def test_worker_uses_openrouter_client(monkeypatch, tmp_path):
-    """When gemini_backend=openrouter, GeminiWorker constructs OpenRouterGeminiClient."""
+def test_worker_uses_openrouter_provider(monkeypatch, tmp_path):
+    """When gemini_backend=openrouter, GeminiWorker uses OpenRouterProvider via ImageGateway."""
     monkeypatch.setattr(settings, "gemini_backend", "openrouter")
     monkeypatch.setattr(settings, "openrouter_api_key", "sk-or-test-key")
     monkeypatch.setattr(settings, "output_dir", tmp_path)
 
     worker = GeminiWorker()
-    assert isinstance(worker.client, OpenRouterGeminiClient)
+    # The provider is now abstracted behind ImageGateway; we verify the gateway
+    # has an OpenRouterProvider by checking the internal provider instance.
+    from server.generation.providers import OpenRouterProvider
+    provider = worker._gateway._provider_for("CREATE_FROM_REFERENCES")
+    assert isinstance(provider, OpenRouterProvider)
 
 
-def test_worker_uses_chrome_client(monkeypatch, tmp_path):
-    """When gemini_backend=chrome, GeminiWorker constructs PersistentGeminiClient."""
-    from persistent_client import PersistentGeminiClient
+def test_worker_uses_chrome_provider(monkeypatch, tmp_path):
+    """When gemini_backend=chrome, GeminiWorker uses ChromeProvider via ImageGateway."""
+    from server.generation.providers import ChromeProvider
 
     monkeypatch.setattr(settings, "gemini_backend", "chrome")
     monkeypatch.setattr(settings, "output_dir", tmp_path)
@@ -35,9 +39,8 @@ def test_worker_uses_chrome_client(monkeypatch, tmp_path):
     monkeypatch.setattr(settings, "chrome_wait_timeout", 120)
 
     worker = GeminiWorker()
-    assert isinstance(worker.client, PersistentGeminiClient)
-    assert worker.client.port == 9222
-    assert worker.client.output_dir == tmp_path
+    provider = worker._gateway._provider_for("CREATE_FROM_REFERENCES")
+    assert isinstance(provider, ChromeProvider)
 
 
 def test_openrouter_backend_requires_api_key(monkeypatch, tmp_path):
@@ -45,8 +48,6 @@ def test_openrouter_backend_requires_api_key(monkeypatch, tmp_path):
     monkeypatch.setattr(settings, "gemini_backend", "openrouter")
     monkeypatch.setattr(settings, "openrouter_api_key", "")
     monkeypatch.setattr(settings, "output_dir", tmp_path)
-
-    from server.openrouter_client import OpenRouterError
 
     with pytest.raises(OpenRouterError):
         GeminiWorker()
