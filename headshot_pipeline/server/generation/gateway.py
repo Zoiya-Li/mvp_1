@@ -12,6 +12,7 @@ from typing import Literal
 from ..config import settings
 from ..image_gateway import ImageOperation, provider_for_operation
 from .providers import ChromeProvider, ImageProvider, OpenRouterProvider
+from .smart_router import SmartModelRouter
 
 ImageOperation = Literal[
     "CREATE_FROM_REFERENCES",
@@ -31,6 +32,7 @@ class ImageGateway:
     def __init__(self) -> None:
         self._openrouter: OpenRouterProvider | None = None
         self._chrome: ChromeProvider | None = None
+        self._smart_router = SmartModelRouter()
         self._init_providers()
 
     def _init_providers(self) -> None:
@@ -55,6 +57,35 @@ class ImageGateway:
             )
         else:
             raise RuntimeError(f"Unknown gemini_backend: {settings.gemini_backend}")
+
+    # -- smart routing --
+
+    def route_by_task(
+        self,
+        task_type: str,
+        shot_spec: dict | None = None,
+        user_tier: str = "standard",
+        budget_remaining: float | None = None,
+    ) -> dict:
+        """Return smart routing decision for a task.
+
+        This is the entry point for task-aware model selection.
+        Business code should call this before operations to log routing decisions.
+        """
+        decision = self._smart_router.route_for_task(
+            task_type=task_type,  # type: ignore[arg-type]
+            shot_spec=shot_spec,
+            user_tier=user_tier,
+            budget_remaining=budget_remaining,
+        )
+        return {
+            "provider": decision.provider,
+            "model": decision.model,
+            "reason": decision.reason,
+            "estimated_cost": decision.estimated_cost,
+            "estimated_latency_ms": decision.estimated_latency_ms,
+            "confidence": decision.confidence,
+        }
 
     # -- provider selection --
 
