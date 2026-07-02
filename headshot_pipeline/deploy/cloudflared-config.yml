@@ -1,0 +1,17 @@
+# Cloudflare Tunnel 配置模板
+# 使用方法:
+#   1. cloudflared tunnel login
+#   2. cloudflared tunnel create shanxiang
+#   3. cloudflared tunnel route dns shanxiang <your-domain>
+#   4. 将下面的 <TUNNEL_ID> 替换为实际 ID
+#   5. 复制到 ~/.cloudflared/config.yml
+
+tunnel: <TUNNEL_ID>
+credentials-file: <HOME>/.cloudflared/<TUNNEL_ID>.json
+
+ingress:
+  # 所有流量先到 Next.js (:3000)
+  # Next.js 的 rewrite 把 /api/* 和 /ws/* 代理到 FastAPI (:8000)
+  - hostname: <YOUR_DOMAIN>
+    service: http://localhost:3000
+  - service: http_status:404

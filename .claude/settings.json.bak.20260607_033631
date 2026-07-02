@@ -1,0 +1,27 @@
+{
+  "env": {
+    "ANTHROPIC_AUTH_TOKEN": "744fb807574843f299d990bc4f028a88.RrRG2XmIo8pnhqCq",
+    "ANTHROPIC_BASE_URL": "https://open.bigmodel.cn/api/anthropic",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "glm-5.1",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "glm-5.1",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-5.1",
+    "ANTHROPIC_MODEL": "glm-5.1",
+    "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "120000",
+    "API_TIMEOUT_MS": "900000",
+    "CLAUDE_STREAM_IDLE_TIMEOUT_MS": "900000",
+    "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "8000",
+    "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
+    "CLAUDE_CODE_MAX_RETRIES": "2",
+    "HTTP_PROXY": "",
+    "HTTPS_PROXY": "",
+    "ALL_PROXY": "",
+    "http_proxy": "",
+    "https_proxy": "",
+    "all_proxy": "",
+    "NO_PROXY": "open.bigmodel.cn,.bigmodel.cn,localhost,127.0.0.1",
+    "no_proxy": "open.bigmodel.cn,.bigmodel.cn,localhost,127.0.0.1"
+  },
+  "includeCoAuthoredBy": false,
+  "skipDangerousModePermissionPrompt": true,
+  "theme": "dark"
+}

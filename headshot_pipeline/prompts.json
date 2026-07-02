@@ -1,0 +1,389 @@
+{
+  "description": "FlashShot AI 写真馆 — Template-based portrait style system v4.0",
+  "version": "4.0",
+  "note": "写真馆主题模板库：每个模板定义一种艺术/主题写真风格。gen_prompt 用于生成模板参考图；prompt 是面向用户的真实生成指令，要求保留用户本人身份并套用模板风格。",
+  "styles": {
+    "id_photo": {
+      "label": "证件照",
+      "label_en": "ID Photo",
+      "use_cases": [
+        "身份证",
+        "护照",
+        "签证",
+        "简历",
+        "考试报名"
+      ],
+      "templates": [
+        {
+          "id": "id_m_red",
+          "gender": "male",
+          "template_image": "templates/id_m_red.png",
+          "label": "红底·标准证件照",
+          "gen_prompt": "Generate a Chinese standard ID photo of a young East Asian man in his 20s. Front-facing, head centered, shoulders visible. White shirt with clean collar. Neutral pleasant expression, mouth closed. Solid red background (RGB 255,0,0). Even flat studio lighting, no harsh shadows. Hair neatly combed. High resolution, photorealistic, natural skin texture, no beauty filter.",
+          "prompt": "参考第一张图片的风格（背景颜色、构图、灯光），为第二张照片中的人物生成一张同款风格的标准证件照。保持人物的真实面部特征和身份，正面免冠，表情自然。自然皮肤质感，不要美颜滤镜，真实感强。"
+        },
+        {
+          "id": "id_m_blue",
+          "gender": "male",
+          "template_image": "templates/id_m_blue.png",
+          "label": "蓝底·标准证件照",
+          "gen_prompt": "Generate a Chinese standard ID photo of an East Asian man in his 30s. Front-facing, centered head and shoulders. Light blue dress shirt, top button undone. Neutral expression with a hint of smile. Solid blue background (RGB 67,142,219). Flat even lighting. Hair neat. Photorealistic, no skin smoothing, no AI artifacts.",
+          "prompt": "参考第一张图片的风格（背景颜色、构图、灯光），为第二张照片中的人物生成一张同款风格的标准证件照。保持人物的真实面部特征和身份，正面免冠，表情自然。自然皮肤质感，不要美颜滤镜，真实感强。"
+        },
+        {
+          "id": "id_f_white",
+          "gender": "female",
+          "template_image": "templates/id_f_white.png",
+          "label": "白底·签证/护照",
+          "gen_prompt": "Generate a professional white-background ID photo of a young East Asian woman in her 20s. Front-facing, head centered, shoulders visible. Dark blue V-neck top. Hair neatly styled away from face. Light natural makeup. Pleasant composed expression. Pure white background. Soft even studio lighting. Photorealistic, natural skin texture, no beauty filter.",
+          "prompt": "参考第一张图片的风格（背景颜色、构图、灯光），为第二张照片中的人物生成一张同款风格的标准证件照。保持人物的真实面部特征和身份，正面免冠，表情自然。自然皮肤质感，不要美颜滤镜，真实感强。"
+        },
+        {
+          "id": "id_f_red",
+          "gender": "female",
+          "template_image": "templates/id_f_red.png",
+          "label": "红底·标准证件照",
+          "gen_prompt": "Generate a Chinese red-background ID photo of an East Asian woman in her 20s. Front-facing, centered. White collar blouse. Hair natural and fresh. Minimal makeup. Pleasant neutral expression. Solid red background. Flat even lighting. No shadows. Photorealistic, natural skin pores visible, no plastic skin. High resolution.",
+          "prompt": "参考第一张图片的风格（背景颜色、构图、灯光），为第二张照片中的人物生成一张同款风格的标准证件照。保持人物的真实面部特征和身份，正面免冠，表情自然。自然皮肤质感，不要美颜滤镜，真实感强。"
+        }
+      ]
+    },
+    "business": {
+      "label": "都市精英",
+      "label_en": "Urban Professional",
+      "use_cases": [
+        "职场形象",
+        "LinkedIn",
+        "个人品牌",
+        "商务社交",
+        "气质写真"
+      ],
+      "templates": [
+        {
+          "id": "bf_m_01",
+          "gender": "male",
+          "template_image": "templates/bf_m_01.png",
+          "label": "经典商务·深蓝西装",
+          "gen_prompt": "Generate a professional business headshot of a young East Asian man in his late 20s wearing a well-fitted navy blue suit, white dress shirt, subtle patterned tie. Clean-shaven, neat short hair. Soft studio lighting with slight Rembrandt pattern. Background gradient from dark charcoal to light gray. Shallow depth of field, 85mm f/2.8. Confident approachable expression with slight smile. Photorealistic, natural skin texture.",
+          "prompt": "参考第一张图片的风格（构图、灯光、背景、服装），为第二张照片中的人物生成一张同款风格的专业商务人像照。保持人物的真实面部特征和身份，只借鉴风格。自然皮肤质感，不要美颜滤镜，真实感强。"
+        },
+        {
+          "id": "bf_m_03",
+          "gender": "male",
+          "template_image": "templates/bf_m_03.png",
+          "label": "经典商务·黑西装金丝眼镜",
+          "gen_prompt": "Generate a professional business headshot of an East Asian man around 35, wearing a black suit with crisp white shirt and burgundy tie. Thin metal frame glasses. Hair neatly styled. Studio lighting with clean white background slightly out of focus. Three-quarter turn facing camera. Natural skin texture. Serious but warm. Photorealistic, magazine editorial style.",
+          "prompt": "参考第一张图片的风格（构图、灯光、背景、服装），为第二张照片中的人物生成一张同款风格的专业商务人像照。保持人物的真实面部特征和身份，只借鉴风格。自然皮肤质感，不要美颜滤镜，真实感强。"
+        },
+        {
+          "id": "bf_m_tech",
+          "gender": "male",
+          "template_image": "templates/bf_m_tech.png",
+          "label": "科技互联网·休闲质感",
+          "gen_prompt": "Generate a modern tech-industry professional headshot of an East Asian man in his late 20s or early 30s. He wears a well-fitted dark blue crew-neck t-shirt under a casual unstructured blazer in charcoal. No tie. Hair is modern, slightly textured. The lighting is soft and natural, as from a large window. Background is a clean, modern open-plan office with glass walls, very softly blurred. Expression is relaxed, confident, slightly smiling. Shot on 85mm f/2, natural tones, no over-processing. Think Silicon Valley tech leader portrait.",
+          "prompt": "参考第一张图片的风格（构图、灯光、背景、服装），为第二张照片中的人物生成一张同款风格的专业商务人像照。保持人物的真实面部特征和身份，只借鉴风格。自然皮肤质感，不要美颜滤镜，真实感强。"
+        },
+        {
+          "id": "bf_f_01",
+          "gender": "female",
+          "template_image": "templates/bf_f_01.png",
+          "label": "经典商务·米色西装",
+          "gen_prompt": "Generate a professional business headshot of a young East Asian woman in her late 20s. Tailored cream-colored blazer over white silk blouse. Shoulder-length hair with soft waves. Light neutral makeup. Studio lighting with soft key light and gentle fill. Warm light gray gradient background. Three-quarter pose with confident friendly smile. 85mm f/2.8. Natural skin texture, no over-smoothing.",
+          "prompt": "参考第一张图片的风格（构图、灯光、背景、服装），为第二张照片中的人物生成一张同款风格的专业商务人像照。保持人物的真实面部特征和身份，只借鉴风格。自然皮肤质感，不要美颜滤镜，真实感强。"
+        },
+        {
+          "id": "bf_f_03",
+          "gender": "female",
+          "template_image": "templates/bf_f_03.png",
+          "label": "经典商务·黑色连衣裙",
+          "gen_prompt": "Generate a modern corporate headshot of an East Asian woman around 40. Fitted black dress with subtle V-neck, statement necklace. Sleek bob hairstyle. Professional lighting with warm golden-hour quality. Background is softly blurred modern lobby with floor-to-ceiling windows. Warm authoritative expression. Canon EOS R5, 85mm. Realistic, natural skin texture.",
+          "prompt": "参考第一张图片的风格（构图、灯光、背景、服装），为第二张照片中的人物生成一张同款风格的专业商务人像照。保持人物的真实面部特征和身份，只借鉴风格。自然皮肤质感，不要美颜滤镜，真实感强。"
+        },
+        {
+          "id": "bf_f_tech",
+          "gender": "female",
+          "template_image": "templates/bf_f_tech.png",
+          "label": "科技互联网·现代质感",
+          "gen_prompt": "Generate a modern tech-industry professional headshot of an East Asian woman in her late 20s or early 30s. She wears a simple black turtleneck, minimal jewelry (small stud earrings). Hair is straight and neat, shoulder length. The lighting is bright and even, as from a large north-facing window. Background is a clean white/very light gray, minimal and modern. She has a confident, approachable smile. Shot on 85mm f/2.8, clean and crisp. Think Apple keynote speaker portrait. Natural skin, no beauty filter.",
+          "prompt": "参考第一张图片的风格（构图、灯光、背景、服装），为第二张照片中的人物生成一张同款风格的专业商务人像照。保持人物的真实面部特征和身份，只借鉴风格。自然皮肤质感，不要美颜滤镜，真实感强。"
+        },
+        {
+          "id": "bf_m_04",
+          "gender": "male",
+          "template_image": "templates/bf_m_04.png",
+          "label": "现代商务·墨绿西装",
+          "gen_prompt": "Generate a modern professional headshot of a young East Asian man in his early 30s. Tailored dark green blazer over white turtleneck. Contemporary style. Soft natural window lighting from right side. Blurred modern office with green plants. Relaxed confident expression. 85mm, shallow depth of field. Natural skin tones.",
+          "prompt": "参考第一张图片的风格（构图、灯光、背景、服装），为第二张照片中的人物生成一张同款风格的专业商务人像照。保持人物的真实面部特征和身份，只借鉴风格。自然皮肤质感，不要美颜滤镜，真实感强。"
+        },
+        {
+          "id": "bf_f_04",
+          "gender": "female",
+          "template_image": "templates/bf_f_04.png",
+          "label": "现代商务·粉色西装",
+          "gen_prompt": "Generate a professional business headshot of a young East Asian woman in her early 30s. Soft pink blazer over white collared shirt. Professional straight hair framing face. Delicate gold jewelry. Bright even studio lighting with light blue-gray background. Slight head tilt, genuine approachable smile. Photorealistic, no skin smoothing. LinkedIn premium headshot quality.",
+          "prompt": "参考第一张图片的风格（构图、灯光、背景、服装），为第二张照片中的人物生成一张同款风格的专业商务人像照。保持人物的真实面部特征和身份，只借鉴风格。自然皮肤质感，不要美颜滤镜，真实感强。"
+        }
+      ]
+    },
+    "academic": {
+      "label": "知性文艺",
+      "label_en": "Intellectual & Artistic",
+      "use_cases": [
+        "文艺写真",
+        "知性形象",
+        "个人主页",
+        "书卷气质"
+      ],
+      "templates": [
+        {
+          "id": "ac_m_01",
+          "gender": "male",
+          "template_image": "templates/ac_m_01.png",
+          "label": "休闲西装·书卷气",
+          "gen_prompt": "Generate an academic profile headshot of an East Asian man in his early 30s, like a young professor. Dark brown casual blazer over light blue Oxford shirt, no tie. Friendly intellectual expression. Soft natural lighting near a university office window. Background is blurred bookshelf with visible book spines. 50mm lens, natural candid feel. No heavy retouching, skin texture preserved. Approachable yet scholarly.",
+          "prompt": "参考第一张图片的风格（构图、灯光、背景、服装），为第二张照片中的人物生成一张同款风格的学术形象照。保持人物的真实面部特征和身份，只借鉴风格。自然皮肤质感，不要美颜滤镜，真实感强。"
+        },
+        {
+          "id": "ac_f_01",
+          "gender": "female",
+          "template_image": "templates/ac_f_01.png",
+          "label": "针织开衫·温和知性",
+          "gen_prompt": "Generate an academic headshot of an East Asian woman in her mid-30s, like a university professor. Warm beige cardigan over white blouse. Natural hairstyle framing face. Small framed glasses. Warm approachable smile. Soft diffused lighting, warm tones. Background is blurred campus greenery. Natural and genuine, like a university faculty page photo. No beauty filter, realistic skin texture.",
+          "prompt": "参考第一张图片的风格（构图、灯光、背景、服装），为第二张照片中的人物生成一张同款风格的学术形象照。保持人物的真实面部特征和身份，只借鉴风格。自然皮肤质感，不要美颜滤镜，真实感强。"
+        }
+      ]
+    },
+    "social": {
+      "label": "生活感写真",
+      "label_en": "Lifestyle Portrait",
+      "use_cases": [
+        "朋友圈",
+        "小红书",
+        "社交头像",
+        "生活记录"
+      ],
+      "templates": [
+        {
+          "id": "lw_m_01",
+          "gender": "male",
+          "template_image": "templates/lw_m_01.png",
+          "label": "都市天台·日落金光",
+          "gen_prompt": "Generate a lifestyle professional portrait of an East Asian man in his late 20s. Well-fitted light gray casual blazer over plain white t-shirt. Modern, clean, fashion-forward. Soft golden-hour outdoor lighting on a city rooftop. Blurred urban skyline with warm sunset tones. Relaxed confident expression, slight smirk. 85mm f/1.8, creamy bokeh. Natural skin, no over-retouching. Premium Xiaohongshu aesthetic.",
+          "prompt": "参考第一张图片的风格（构图、灯光、背景、服装），为第二张照片中的人物生成一张同款风格的生活感职场人像照。保持人物的真实面部特征和身份，只借鉴风格。自然皮肤质感，不要美颜滤镜，真实感强。"
+        },
+        {
+          "id": "lw_m_02",
+          "gender": "male",
+          "template_image": "templates/lw_m_02.png",
+          "label": "针织毛衣·咖啡店风",
+          "gen_prompt": "Generate a modern casual professional portrait of an East Asian man around 30. Dark olive green knit sweater with clean collar underneath. Modern slightly textured short haircut. Warm indoor lighting as in a stylish coffee shop. Blurred background with warm wooden tones and green plants. Relaxed approachable with genuine smile. 50mm, natural and candid. No beauty filter. Premium social media aesthetic.",
+          "prompt": "参考第一张图片的风格（构图、灯光、背景、服装），为第二张照片中的人物生成一张同款风格的生活感职场人像照。保持人物的真实面部特征和身份，只借鉴风格。自然皮肤质感，不要美颜滤镜，真实感强。"
+        },
+        {
+          "id": "lw_f_01",
+          "gender": "female",
+          "template_image": "templates/lw_f_01.png",
+          "label": "奶油色针织·柔光",
+          "gen_prompt": "Generate a modern lifestyle professional portrait of an East Asian woman in her late 20s. Cream-colored knit turtleneck sweater. Hair with gentle waves, natural style. Soft diffused lighting with gentle warm glow. Blurred minimalist indoor space with warm tones. Calm confident expression with soft smile. 85mm f/1.4, creamy bokeh. Natural skin, no beauty filter. Premium Xiaohongshu profile photo quality.",
+          "prompt": "参考第一张图片的风格（构图、灯光、背景、服装），为第二张照片中的人物生成一张同款风格的生活感职场人像照。保持人物的真实面部特征和身份，只借鉴风格。自然皮肤质感，不要美颜滤镜，真实感强。"
+        },
+        {
+          "id": "lw_f_02",
+          "gender": "female",
+          "template_image": "templates/lw_f_02.png",
+          "label": "黑色西装·休闲职场",
+          "gen_prompt": "Generate a casual professional headshot of an East Asian woman around 30. Well-cut black blazer over white V-neck top, styled casually with slightly oversized fit. Low ponytail with loose strands framing face. Small gold hoop earrings. Modern coworking space with natural light from large windows. Warm tones and blurred green plants. Warm genuine smile. Natural lighting, no flash. Realistic skin texture. Contemporary and aspirational.",
+          "prompt": "参考第一张图片的风格（构图、灯光、背景、服装），为第二张照片中的人物生成一张同款风格的生活感职场人像照。保持人物的真实面部特征和身份，只借鉴风格。自然皮肤质感，不要美颜滤镜，真实感强。"
+        },
+        {
+          "id": "social_m_street",
+          "gender": "male",
+          "template_image": "templates/social_m_street.png",
+          "label": "INS街头·潮流感",
+          "gen_prompt": "Generate an Instagram-style street fashion portrait of an East Asian man in his mid-20s. He wears an oversized beige hoodie under a black puffer vest, with a silver chain necklace visible. A backwards black cap on his head. The scene is a city sidewalk with a graffiti wall in soft pastel colors blurred behind him. Golden hour sunlight casts warm tones across his face. His expression is cool and effortless, looking slightly off-camera with a relaxed jaw. Shot on iPhone 15 Pro in portrait mode — natural lens characteristics, slight warmth, not overly sharp. The color grade is warm with lifted shadows — typical Instagram filter aesthetic. Natural skin texture, no beauty filter. Portrait orientation (vertical, taller than wide).",
+          "prompt": "参考第一张图片的风格（构图、灯光、背景、色调、氛围），为第二张照片中的人物生成一张同款风格的社交头像。保持人物的真实面部特征和身份，只借鉴风格。自然皮肤质感，不要美颜滤镜，真实感强。"
+        },
+        {
+          "id": "social_f_french",
+          "gender": "female",
+          "template_image": "templates/social_f_french.png",
+          "label": "法式慵懒·随性优雅",
+          "gen_prompt": "Generate a French-girl effortless chic portrait of an East Asian woman in her late 20s. She wears a Breton-striped boat-neck top (blue and white stripes) with a slightly oversized fit. Her hair is in a messy French twist with loose strands framing her face. Minimal makeup — just brushed brows, a hint of blush, and a natural rosy lip. She holds a small espresso cup near her chin with both hands. The background is a blurred Parisian-style cafe terrace with warm tones — rattan chairs, a small round table, green plant leaves. Soft natural daylight, slightly overcast for even lighting. Her expression is relaxed and effortlessly elegant, a gentle half-smile. Shot on 50mm f/2, warm film-like color grading with lifted blacks. Natural skin texture, no beauty filter. Portrait orientation (vertical, taller than wide).",
+          "prompt": "参考第一张图片的风格（构图、灯光、背景、色调、氛围），为第二张照片中的人物生成一张同款风格的社交头像。保持人物的真实面部特征和身份，只借鉴风格。自然皮肤质感，不要美颜滤镜，真实感强。"
+        }
+      ]
+    },
+    "jk_portrait": {
+      "label": "日系·韩系写真",
+      "label_en": "Japanese & Korean Portrait",
+      "use_cases": [
+        "个人写真",
+        "社交媒体",
+        "小红书",
+        "朋友圈"
+      ],
+      "templates": [
+        {
+          "id": "jp_m_fresh",
+          "gender": "male",
+          "template_image": "templates/jp_m_fresh.png",
+          "label": "日系清新·少年感",
+          "gen_prompt": "Generate a Japanese-style fresh portrait of an East Asian man in his early 20s. He wears a simple white linen shirt, slightly unbuttoned at the top. Hair is natural, slightly wavy, sun-bleached tips. The scene is outdoors on a bright overcast day — soft flat lighting characteristic of Japanese photography. Background is a blurred grassy field with soft green tones. Expression is gentle, slightly looking away from camera with a subtle smile. Shot on Fuji Pro 400H film simulation — slightly lifted shadows, soft pastel greens, low contrast. 50mm f/2, dreamy quality. The overall feeling is nostalgic, clean, and innocent — like a still from a Shunji Iwai film.",
+          "prompt": "参考第一张图片的风格（构图、灯光、背景、色调、氛围），为第二张照片中的人物生成一张同款风格的日系清新写真。保持人物的真实面部特征和身份，只借鉴风格。自然皮肤质感，不要美颜滤镜，真实感强。"
+        },
+        {
+          "id": "jp_f_fresh",
+          "gender": "female",
+          "template_image": "templates/jp_f_fresh.png",
+          "label": "日系清新·空气感",
+          "gen_prompt": "Generate a Japanese-style fresh portrait of an East Asian woman in her early 20s. She wears a simple white cotton dress with thin straps. Hair is natural, slightly messy with loose strands catching the light. The scene is shot with strong backlighting — the sun behind her creating a soft halo and lens flare. Background is a blurred blue sky with soft white clouds. Expression is dreamy, looking slightly downward with closed-lip smile. Shot on Fuji Pro 400H film simulation — lifted blacks, pastel tones, low saturation. 85mm f/1.4, extremely shallow depth of field. The feeling is airy, weightless, like a morning in a Hayao Miyazaki film. Natural skin, no beauty filter. IMPORTANT: Generate in portrait orientation (vertical, 3:4 aspect ratio, taller than wide).",
+          "prompt": "参考第一张图片的风格（构图、灯光、背景、色调、氛围），为第二张照片中的人物生成一张同款风格的日系清新写真。保持人物的真实面部特征和身份，只借鉴风格。自然皮肤质感，不要美颜滤镜，真实感强。"
+        },
+        {
+          "id": "kr_m_minimal",
+          "gender": "male",
+          "template_image": "templates/kr_m_minimal.png",
+          "label": "韩式极简·高级灰",
+          "gen_prompt": "Generate a Korean-style minimalist portrait of an East Asian man in his mid-20s. He wears a simple black turtleneck. Hair is neatly styled, slightly parted. The background is a clean, solid light warm gray — no texture, no objects. The lighting is soft and even, almost shadowless, from a large softbox directly in front. The expression is calm, neutral, with a very subtle confident look. Shot on 85mm f/2.8. The color palette is desaturated — warm grays, blacks, natural skin tone. The style references Korean studio photography (like a K-pop album cover or Seoul studio portrait). Clean, modern, expensive-looking. Natural skin texture visible, no smoothing.",
+          "prompt": "参考第一张图片的风格（构图、灯光、背景、色调、氛围），为第二张照片中的人物生成一张同款风格的韩式极简写真。保持人物的真实面部特征和身份，只借鉴风格。自然皮肤质感，不要美颜滤镜，真实感强。"
+        },
+        {
+          "id": "kr_f_elegant",
+          "gender": "female",
+          "template_image": "templates/kr_f_elegant.png",
+          "label": "韩式优雅·丝绸质感",
+          "gen_prompt": "Generate a Korean-style elegant portrait of an East Asian woman in her mid-20s. She wears a cream silk blouse with a soft draped neckline. Hair is sleek and straight, parted in the middle, tucked behind one ear. Makeup is the classic Korean natural look — dewy skin, straight brows, soft pink lips. The background is a soft warm beige, slightly gradient. Lighting is from a large soft window, creating a gentle glow on her face with soft shadows. Expression is serene and composed with a very subtle smile. Shot on 85mm f/2, sharp focus on eyes. The overall style references high-end Korean beauty photography — soft, luminous, refined. Natural dewy skin texture, no heavy retouching. IMPORTANT: Generate in portrait orientation (vertical, 3:4 aspect ratio, taller than wide).",
+          "prompt": "参考第一张图片的风格（构图、灯光、背景、色调、氛围），为第二张照片中的人物生成一张同款风格的韩式优雅写真。保持人物的真实面部特征和身份，只借鉴风格。自然皮肤质感，不要美颜滤镜，真实感强。"
+        }
+      ]
+    },
+    "chinese_style": {
+      "label": "国风写真馆",
+      "label_en": "Chinese Traditional",
+      "use_cases": [
+        "汉服写真",
+        "旗袍写真",
+        "古风摄影",
+        "新中式"
+      ],
+      "templates": [
+        {
+          "id": "gf_m_hanfu",
+          "gender": "male",
+          "template_image": "templates/gf_m_hanfu.png",
+          "label": "汉服·文人雅士",
+          "gen_prompt": "Generate a Chinese traditional style portrait of an East Asian man in his late 20s wearing elegant Hanfu — a light blue-green silk robe (青色长衫) with subtle floral embroidery and a white inner collar. Hair is half-tied in a traditional topknot with a simple jade hairpin. The background is a blurred traditional Chinese garden with curved rooflines, bamboo, and a misty pond. The lighting is soft and diffused, as on an overcast autumn day — gentle, poetic. The expression is calm and contemplative, gazing slightly to the side. Shot on 85mm f/2, with a slightly desaturated, ink-wash painting color palette — muted blues, greens, and warm earth tones. The feeling is scholarly, refined, like a figure from a Tang dynasty painting. Natural skin, no beauty filter, realistic texture.",
+          "prompt": "参考第一张图片的风格（构图、灯光、背景、色调、服装），为第二张照片中的人物生成一张同款风格的汉服古风写真。保持人物的真实面部特征和身份，只借鉴风格和服装。自然皮肤质感，不要美颜滤镜，真实感强。"
+        },
+        {
+          "id": "gf_f_qipao",
+          "gender": "female",
+          "template_image": "templates/gf_f_qipao.png",
+          "label": "旗袍·民国风情",
+          "gen_prompt": "Generate a Chinese Republican-era style portrait of an East Asian woman in her mid-20s. She wears a fitted dark green silk qipao (cheongsam) with subtle floral patterns, mandarin collar, and delicate frog buttons. Hair is in elegant finger waves (民国卷发), with a small vintage hair clip. The background is a blurred old Shanghai alley — warm-toned brick walls, a distant traditional doorway with warm lamplight. The lighting is warm and soft, with a golden glow as if from a nearby lantern, creating gentle Rembrandt lighting on her face. Expression is poised and elegant, with a hint of nostalgic melancholy. Shot on 85mm f/1.8, shallow depth of field. The color palette is warm — deep greens, amber golds, soft skin tones. The mood is nostalgic, like a still from a Wong Kar-wai film or a Zhang Yimou period piece. Natural skin, no beauty filter. IMPORTANT: Generate in portrait orientation (vertical, 3:4 aspect ratio, taller than wide).",
+          "prompt": "参考第一张图片的风格（构图、灯光、背景、色调、服装），为第二张照片中的人物生成一张同款风格的民国旗袍写真。保持人物的真实面部特征和身份，只借鉴风格和服装。自然皮肤质感，不要美颜滤镜，真实感强。"
+        }
+      ]
+    },
+    "fashion": {
+      "label": "时尚大片",
+      "label_en": "Fashion Editorial",
+      "use_cases": [
+        "杂志写真",
+        "个人大片",
+        "模特卡",
+        "高级感肖像"
+      ],
+      "templates": [
+        {
+          "id": "fz_m_editorial",
+          "gender": "male",
+          "template_image": "templates/fz_m_editorial.png",
+          "label": "大片质感·高对比",
+          "gen_prompt": "Generate a high-end fashion editorial portrait of an East Asian man in his mid-20s. He wears a structured black leather jacket over a white crew-neck t-shirt. Hair is styled in a modern textured pompadour. The lighting is dramatic — a single hard key light from the upper left creating strong shadows on the right side of his face (split lighting). Background is a deep charcoal, almost black, with a subtle gradient. His expression is intense and confident, looking directly into the camera with a slight squint. Shot on medium format (Hasselblad), 85mm equivalent, extremely sharp. High contrast, deep blacks, rich tones. The style references Vogue Hommes or GQ editorial photography. Natural skin texture with visible pores, no smoothing. Magazine cover quality.",
+          "prompt": "参考第一张图片的风格（构图、灯光、背景、色调、氛围），为第二张照片中的人物生成一张同款风格的时尚杂志大片。保持人物的真实面部特征和身份，只借鉴风格。自然皮肤质感，不要美颜滤镜，真实感强。"
+        },
+        {
+          "id": "fz_f_editorial",
+          "gender": "female",
+          "template_image": "templates/fz_f_editorial.png",
+          "label": "大片质感·高级冷调",
+          "gen_prompt": "Generate a high-end fashion editorial portrait of an East Asian woman in her mid-20s. She wears a structured oversized black blazer with nothing underneath, draped off one shoulder. Hair is slicked back tightly into a low bun. Bold eyebrow makeup, nude lips, no blush — the classic editorial beauty look. The lighting is a cool-toned studio setup with a ring light creating a distinctive circular catchlight in her eyes, plus a subtle blue-tinted rim light from behind. Background is a cool light gray studio backdrop. Expression is powerful and commanding, chin slightly raised, looking down at the camera. Shot on medium format, extremely sharp focus. The color palette is desaturated with cool blue undertones. The style references Vogue or Harper's Bazaar cover photography. Natural skin texture, pores visible, no smoothing. IMPORTANT: Generate in portrait orientation (vertical, 3:4 aspect ratio, taller than wide).",
+          "prompt": "参考第一张图片的风格（构图、灯光、背景、色调、氛围），为第二张照片中的人物生成一张同款风格的时尚杂志大片。保持人物的真实面部特征和身份，只借鉴风格。自然皮肤质感，不要美颜滤镜，真实感强。"
+        }
+      ]
+    },
+    "cinematic": {
+      "label": "电影感写真",
+      "label_en": "Cinematic & Mood",
+      "use_cases": [
+        "氛围感写真",
+        "故事感肖像",
+        "艺术写真",
+        "情绪片"
+      ],
+      "templates": [
+        {
+          "id": "film_m_cyber",
+          "gender": "male",
+          "template_image": "templates/film_m_cyber.png",
+          "label": "赛博朋克·霓虹夜景",
+          "gen_prompt": "Generate a cinematic cyberpunk portrait of an East Asian man in his mid-20s. He wears a dark hoodie with the hood partially up, over a black t-shirt. The scene is at night in a neon-lit city alley. Vivid cyan and magenta neon lights illuminate his face from different angles, creating a dramatic split-color effect — cyan on the left, magenta on the right. Rain-slicked street reflects the neon colors. His expression is intense and mysterious, looking directly at the camera. Shot anamorphic (2.39:1 aspect ratio feel, cropped portrait), with characteristic anamorphic lens flare. The color grading is teal and orange with deep shadows. Style references Blade Runner 2049 and cyberpunk anime. Natural skin texture, visible film grain, no beauty filter. IMPORTANT: Generate in portrait orientation (vertical, 3:4 aspect ratio, taller than wide).",
+          "prompt": "参考第一张图片的风格（构图、灯光、背景、色调、氛围），为第二张照片中的人物生成一张同款风格的赛博朋克氛围写真。保持人物的真实面部特征和身份，只借鉴风格。自然皮肤质感，不要美颜滤镜，真实感强。"
+        },
+        {
+          "id": "film_f_cinematic",
+          "gender": "female",
+          "template_image": "templates/film_f_cinematic.png",
+          "label": "电影感·故事光影",
+          "gen_prompt": "Generate a cinematic portrait of an East Asian woman in her mid-20s with a strong narrative quality. She wears a simple dark turtleneck. The lighting is purely practical — a single warm table lamp to one side, casting deep shadows across half her face (chiaroscuro). Background is a dark room with barely visible warm-toned objects — a bookshelf, a curtain — all in deep shadow. Her expression is contemplative, gazing slightly off-camera, as if lost in thought. Shot on cinema lens ( Cooke S4 ), 85mm T2, with shallow depth of field. The color grading is warm amber highlights with deep teal shadows — classic cinema look. The overall mood is intimate and melancholic, like a frame from a Wong Kar-wai or Edward Yang film. Natural skin texture, subtle film grain, no beauty filter. IMPORTANT: Generate in portrait orientation (vertical, 3:4 aspect ratio, taller than wide).",
+          "prompt": "参考第一张图片的风格（构图、灯光、背景、色调、氛围），为第二张照片中的人物生成一张同款风格的电影感写真。保持人物的真实面部特征和身份，只借鉴风格。自然皮肤质感，不要美颜滤镜，真实感强。"
+        },
+        {
+          "id": "film_f_dark",
+          "gender": "female",
+          "template_image": "templates/film_f_dark.png",
+          "label": "暗黑哥特·神秘感",
+          "gen_prompt": "Generate a dark gothic style portrait of an East Asian woman in her mid-20s. She wears a black velvet off-shoulder top with lace details. Her hair is long, dark, and flowing, partially covering one side of her face. Her makeup is dramatic — dark smokey eyes, deep burgundy lips, pale skin. The lighting is extremely low-key — a single cold blue-tinted light from above, barely illuminating her face, with deep black shadows on the sides. Background is pure darkness with barely visible gothic architectural elements — a stone archway, candlelight far in the distance. Her expression is mysterious and intense, looking directly into the camera. Shot on 85mm f/1.4, extremely shallow depth of field. The color palette is cold — deep blacks, midnight blues, touches of deep red. The mood is dark, elegant, otherworldly — like a Tim Burton film still or a high-end gothic fashion editorial. Natural skin texture, no beauty filter. Portrait orientation (vertical, taller than wide).",
+          "prompt": "参考第一张图片的风格（构图、灯光、背景、色调、氛围），为第二张照片中的人物生成一张同款风格的暗黑哥特写真。保持人物的真实面部特征和身份，只借鉴风格。自然皮肤质感，不要美颜滤镜，真实感强。"
+        }
+      ]
+    },
+    "creative": {
+      "label": "创意主题",
+      "label_en": "Creative & Special",
+      "use_cases": [
+        "个性写真",
+        "复古港风",
+        "森系清新",
+        "运动阳光"
+      ],
+      "templates": [
+        {
+          "id": "cr_m_retro",
+          "gender": "male",
+          "template_image": "templates/cr_m_retro.png",
+          "label": "复古胶片·港风",
+          "gen_prompt": "Generate a retro film-style portrait of an East Asian man in his late 20s, in the style of 1990s Hong Kong cinema. He wears a slightly oversized white button-up shirt with rolled sleeves, top buttons undone. Hair is styled in a classic 90s side-part. The scene is a dimly lit Hong Kong dai pai dong (street food stall) at dusk, with warm tungsten lights and steam rising. The background shows blurred neon signs and city lights in warm orange and green tones. His expression is relaxed and cool, with a subtle half-smile. Shot on Kodak Portra 800 film simulation — warm tones, slight color shift in shadows, visible grain, subtle light leaks on the edges. 50mm f/1.4, shallow depth of field. The mood is nostalgic, romantic, like a still from a Wong Kar-wai film. Natural skin, visible grain, no digital smoothing. IMPORTANT: Generate in portrait orientation (vertical, 3:4 aspect ratio, taller than wide).",
+          "prompt": "参考第一张图片的风格（构图、灯光、背景、色调、氛围），为第二张照片中的人物生成一张同款风格的复古胶片写真。保持人物的真实面部特征和身份，只借鉴风格。自然皮肤质感，不要美颜滤镜，真实感强。"
+        },
+        {
+          "id": "cr_f_forest",
+          "gender": "female",
+          "template_image": "templates/cr_f_forest.png",
+          "label": "森系·自然清新",
+          "gen_prompt": "Generate a nature-inspired ethereal portrait of an East Asian woman in her early 20s. She wears a simple white cotton midi dress with lace details and a woven straw hat tilted slightly back. Hair flows naturally with loose strands catching dappled sunlight. She holds a small wildflower bouquet loosely in one hand. The setting is a sun-dappled forest clearing with tall trees, ferns, and soft green foliage. Dappled light creates beautiful patterns across her face and dress. Expression is peaceful and dreamy, with closed lips gentle smile. Shot on 85mm f/1.4 with extremely shallow depth of field. The color palette is soft — sage greens, warm gold light, cream whites, earthy browns. The mood is like a Studio Ghibli forest scene or a Scandinavian nature editorial. Natural dewy skin, freckles visible, no beauty filter. IMPORTANT: Generate in portrait orientation (vertical, 3:4 aspect ratio, taller than wide).",
+          "prompt": "参考第一张图片的风格（构图、灯光、背景、色调、氛围），为第二张照片中的人物生成一张同款风格的森系自然写真。保持人物的真实面部特征和身份，只借鉴风格。自然皮肤质感，不要美颜滤镜，真实感强。"
+        },
+        {
+          "id": "cr_m_sport",
+          "gender": "male",
+          "template_image": "templates/cr_m_sport.png",
+          "label": "运动活力·阳光型男",
+          "gen_prompt": "Generate a dynamic sports portrait of an East Asian man in his mid-20s. He wears a fitted dark gray athletic tank top showing defined shoulders and arms. A light sheen of sweat on his skin. Hair is short and slightly messy from activity. The scene is shot outdoors on a bright sunny day — hard golden sunlight from behind creating a strong rim light around his head and shoulders, with fill light on his face. Background is a blurred blue sky with hints of a running track or basketball court. His expression is energized and confident, a slight grin showing determination. Shot on 85mm f/2, high contrast, vibrant colors — deep blues, warm golds, rich skin tones. The mood is athletic, powerful, energetic — like a Nike or Under Armour campaign shot. Natural skin texture with visible sweat, no beauty filter. Portrait orientation (vertical, taller than wide).",
+          "prompt": "参考第一张图片的风格（构图、灯光、背景、色调、氛围），为第二张照片中的人物生成一张同款风格的运动活力写真。保持人物的真实面部特征和身份，只借鉴风格。自然皮肤质感，不要美颜滤镜，真实感强。"
+        }
+      ]
+    }
+  }
+}

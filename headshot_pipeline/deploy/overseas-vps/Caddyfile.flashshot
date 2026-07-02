@@ -1,0 +1,43 @@
+# ─────────────────────────────────────────────────────────────────────
+# FlashShot — ADDITIVE site block for the existing Caddyfile on
+# 66.175.213.242. APPEND this whole block to the Caddyfile; do NOT touch,
+# reorder, or merge with the existing site blocks (Syntropy / fwxt-relay /
+# Tailscale / anything else). FlashShot owns flashshot.top + www.flashshot.top
+# ONLY; Caddy multiplexes by hostname, so this block cannot affect other sites.
+#
+# Routing:
+#   /api/*  → 127.0.0.1:8001  (FastAPI)
+#   /ws/*   → 127.0.0.1:8001  (WebSocket — Caddy upgrades automatically)
+#   *       → 127.0.0.1:3001  (Next.js)
+#
+# PREREQUISITE: DNS A records for BOTH flashshot.top and www.flashshot.top must
+# already point at 66.175.213.242, or Caddy's ACME challenge for this block will
+# fail. A failed challenge for flashshot.top does NOT touch the other sites'
+# certs — but fix DNS before `caddy reload`.
+#
+# Apply:  sudo caddy validate --config /etc/caddy/Caddyfile && sudo systemctl reload caddy
+# ─────────────────────────────────────────────────────────────────────
+
+flashshot.top, www.flashshot.top {
+	encode zstd gzip
+
+	# API + WebSocket → FastAPI. Caddy proxies WebSocket upgrades transparently
+	# (no special header needed). The /ws/{session_id} route has no /api/ prefix
+	# in the app, so list it explicitly here.
+	@api_or_ws path /api/* /ws/*
+	reverse_proxy @api_or_ws 127.0.0.1:8001
+
+	# Everything else → Next.js.
+	reverse_proxy 127.0.0.1:3001
+
+	# Per-site security headers (static; no impact on other site blocks).
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		Permissions-Policy "geolocation=(), microphone=(), camera=()"
+	}
+
+	# Paddle posts the HMAC-signed webhook here. No owner-token auth — the
+	# signature IS the auth. The route is /api/payments/paddle/webhook.
+}

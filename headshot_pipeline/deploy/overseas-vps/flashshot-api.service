@@ -1,0 +1,60 @@
+# FlashShot — FastAPI server (Gemini headshot pipeline + Paddle payment).
+#
+# Runs uvicorn bound to LOOPBACK:8001 behind Caddy (:443 → :8001 for /api/* and
+# /ws/*). It loads env from /opt/flashshot/.env (CWD-relative ".env", read by
+# pydantic-settings in server/config.py — that is the single source of truth,
+# so this unit does NOT use EnvironmentFile). Generation drives the OpenRouter
+# REST API (gemini-3.1-flash-image-preview) STATELESSLY — there is no browser
+# process to attach to, so this unit has NO dependency on any chrome service.
+# (The old flashshot-chrome.service was retired with the Chrome→API pivot.)
+#
+# Install:  sudo install -m644 flashshot-api.service /etc/systemd/system/
+# Enable:   sudo systemctl daemon-reload && sudo systemctl enable --now flashshot-api
+
+[Unit]
+Description=FlashShot - FastAPI server (pipeline + Paddle payment)
+Documentation=file:///opt/flashshot/deploy/overseas-vps/DEPLOY_OVERSEAS_VPS.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=flashshot
+Group=flashshot
+WorkingDirectory=/opt/flashshot
+
+# config.py sets env_file=".env", resolved against CWD=/opt/flashshot.
+# So /opt/flashshot/.env is the one file to edit for all settings.
+
+# Single worker: the resemblance loop is serialized by the in-process job queue
+# (one generation at a time), and 1 worker keeps the shared-box RAM budget
+# honest. The OpenRouter API is stateless per-call, so the worker count is a
+# capacity dial, NOT a correctness constraint — raise it only if free RAM on
+# preflight.sh allows, and bump MemoryMax/MemoryHigh to match.
+ExecStart=/opt/flashshot/.venv/bin/uvicorn server.main:app \
+  --host 127.0.0.1 \
+  --port 8001 \
+  --workers 1
+
+Restart=on-failure
+RestartSec=5
+
+MemoryMax=700M
+MemoryHigh=550M
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+# opencv / numpy / onnxruntime / mediapipe / rembg load large .so files; the
+# hardening above is as strict as the ML stack tolerates. Anything tighter
+# (e.g. RestrictAddressFamilies, SystemCallFilter) tends to break the import.
+# Network egress to openrouter.ai is NOT restricted (no IPAddressDeny), which
+# is required — generation + judge calls leave the box over HTTPS.
+ReadWritePaths=/var/lib/flashshot
+
+[Install]
+WantedBy=multi-user.target

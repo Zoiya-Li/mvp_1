@@ -1,0 +1,57 @@
+# ─────────────────────────────────────────────────────────────
+# 闪像 / ShanXiang — project gitignore (applies under mvp_1/)
+# The repo root is higher up; this file scopes ignores to this product.
+# ─────────────────────────────────────────────────────────────
+
+# ── Sensitive user data & runtime artifacts (NEVER commit) ──
+# User face photos, generated images, SQLite DB, session files
+headshot_pipeline/data/
+# Belt-and-suspenders: session output dirs that leak to the PIPELINE ROOT if
+# the config sentinel (output_dir/upload_dir) ever regresses. config.py now
+# fails loudly at startup if a dir resolves to CWD, but this guarantees no
+# face photo is ever committed even if that guard is bypassed.
+headshot_pipeline/s_*/
+headshot_pipeline/output/
+headshot_pipeline/uploads/
+# Headless Chrome profile (cookies / session state)
+headshot_pipeline/.chrome_profile/
+# ML model weights (ONNX/RemBG/Lama etc.) — large + non-essential to version
+headshot_pipeline/models/
+**/models/*.onnx
+**/models/*.pth
+**/models/*.bin
+# Logs
+headshot_pipeline/logs/
+*.log
+
+# ── Secrets ──
+.env
+.env.*
+!.env.example
+# WeChat Pay / payment certs
+*.pem
+headshot_pipeline/certs/
+
+# ── Python ──
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# ── Node / Next.js (also covered by headshot-landing/.gitignore, repeated
+#    here in case the subdir ignore is ever removed) ──
+node_modules/
+.next/
+out/
+build/
+.DS_Store
+
+# ── Editor / OS ──
+.idea/
+.vscode/
+*.swp
+gemini-image-gen-automation/
