@@ -40,6 +40,7 @@ from .input_quality import (
     assess_reference_photo,
     summarize_reference_set,
 )
+from .learning import LearningLayer
 from .models import (
     FeedbackEvent,
     GeneratedImage,
@@ -785,6 +786,7 @@ class JobQueue:
         self._worker_task: asyncio.Task | None = None
         self._worker: GeminiWorker | None = None
         self._prompts_data: dict | None = None
+        self._learning_layer: LearningLayer | None = None
         # Per-session locks, created on demand. Guards submit/upload mutations.
         self._session_locks: dict[str, asyncio.Lock] = {}
 
@@ -813,6 +815,14 @@ class JobQueue:
             print(f"⚠ Could not reload payment cache from DB ({exc})")
 
         self._load_prompts()
+        # Initialize learning layer for feedback-driven calibration
+        try:
+            self._learning_layer = LearningLayer()
+            cal = self._learning_layer.get_calibration()
+            print(f"✓ Learning layer ready (samples={cal.sample_count})")
+        except Exception as exc:
+            print(f"⚠ Learning layer init failed ({exc}); running with static thresholds")
+            self._learning_layer = None
         try:
             self._worker = GeminiWorker()
             await asyncio.to_thread(self._worker.connect)
@@ -1119,6 +1129,21 @@ class JobQueue:
                 created_at,
             )
             state.user_feedback.append(record)
+            # Also write identity feedback to the learning layer for threshold calibration
+            if self._learning_layer is not None and event in {
+                FeedbackEvent.looks_like_me,
+                FeedbackEvent.not_like_me,
+            }:
+                try:
+                    self._learning_layer.record_feedback(
+                        image_id=image_id,
+                        session_id=session_id,
+                        event=event.value,
+                        score=score,
+                        reason=reason,
+                    )
+                except Exception as exc:
+                    print(f"⚠ Learning layer feedback recording failed: {exc}")
             return record
 
     # ── Photo uploads ─────────────────────────────────

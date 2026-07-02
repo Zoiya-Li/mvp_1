@@ -19,6 +19,7 @@ from .config import settings
 from .evaluation import EvaluationService, AgentRouter
 from .generation import ImageGateway
 from .image_gateway import build_provider_invocation_metadata, estimate_cost
+from .learning import LearningLayer
 from .models import IdentityPack, ShotSpec
 from .repair import FaceSwapRepair, public_repair_metadata
 
@@ -400,7 +401,8 @@ class GeminiWorker:
     def __init__(self):
         self.active_session_id: str | None = None
         self._turn_counts: dict[str, int] = {}
-        self._eval_service = EvaluationService()
+        self._learning_layer = LearningLayer()
+        self._eval_service = EvaluationService(learning_layer=self._learning_layer)
         self._agent_router = AgentRouter(identity_threshold_profile)
         self._face_swap_repair = FaceSwapRepair()
         self._gateway = ImageGateway()

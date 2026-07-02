@@ -11,6 +11,8 @@ import json
 import re
 from pathlib import Path
 
+from ..learning import LearningLayer
+
 # Module-level constants (mirrored from gemini_worker to avoid circular import)
 QUALITY_ACCEPT_THRESHOLD = 8
 IDENTITY_PASS_THRESHOLD = 8
@@ -51,11 +53,28 @@ Be strict. Do not wrap the JSON in markdown."""
 
 
 class EvaluationService:
-    """Self-contained portrait evaluation with lazy-loaded identity scorer."""
+    """Self-contained portrait evaluation with lazy-loaded identity scorer.
 
-    def __init__(self) -> None:
+    When ``learning_layer`` is provided, thresholds are read from the calibrated
+    policy store rather than hard-coded constants.
+    """
+
+    def __init__(self, learning_layer: LearningLayer | None = None) -> None:
         self._identity_app = None
         self._identity_app_load_failed: bool = False
+        self._learning_layer = learning_layer
+
+    def _get_identity_thresholds(self, shot_spec: dict | None = None) -> dict:
+        """Return thresholds, preferring calibrated values when available."""
+        from ..gemini_worker import identity_threshold_profile
+        thresholds = identity_threshold_profile(shot_spec)
+        if self._learning_layer is not None:
+            cal = self._learning_layer.get_calibration()
+            # Override with calibrated values if we have enough samples
+            if cal.sample_count >= 10:
+                thresholds["identity_pass_threshold"] = cal.identity_pass_threshold
+                thresholds["identity_repair_threshold"] = cal.identity_repair_threshold
+        return thresholds
 
     # ── Identity app lazy loader ──────────────────────────────
 
@@ -448,6 +467,13 @@ class EvaluationService:
                     sims.append(float(np.dot(ref_embeddings[i], ref_embeddings[j])))
             ref_consistency = float(sum(sims) / len(sims)) if sims else None
 
+        # Use calibrated cosine threshold if available
+        cosine_threshold = IDENTITY_COSINE_ACCEPT_THRESHOLD
+        if self._learning_layer is not None:
+            cal = self._learning_layer.get_calibration()
+            if cal.sample_count >= 10:
+                cosine_threshold = cal.identity_cosine_accept
+
         score = EvaluationService._identity_cosine_to_score(cosine)
         if score < IDENTITY_REPAIR_THRESHOLD:
             result["hard_failures"].append("identity_too_low")
@@ -459,7 +485,7 @@ class EvaluationService:
                 round(ref_consistency, 4) if ref_consistency is not None else None
             ),
         })
-        result["measurements"]["identity_accept_cosine"] = IDENTITY_COSINE_ACCEPT_THRESHOLD
+        result["measurements"]["identity_accept_cosine"] = cosine_threshold
         if result["hard_failures"]:
             result["notes"] = ", ".join(result["hard_failures"])
         return result
