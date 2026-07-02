@@ -597,11 +597,11 @@ class GeminiWorker:
 
     # ── Hero Preview pipeline (simplified, fast, identity-first) ──
 
-    HERO_PREVIEW_CANDIDATE_COUNT = 1
+    HERO_PREVIEW_CANDIDATE_COUNT = 4
     HERO_PREVIEW_MAX_REGENERATIONS = 1
     HERO_PREVIEW_MAX_LOCAL_EDITS = 1
     HERO_PREVIEW_MAX_IDENTITY_REPAIRS = 1
-    HERO_PREVIEW_MAX_TOTAL_API_COST = 0.35
+    HERO_PREVIEW_MAX_TOTAL_API_COST = 0.6
     HERO_PREVIEW_PROMPT_VERSION = "hero_preview_v1"
 
     def execute_hero_preview(
