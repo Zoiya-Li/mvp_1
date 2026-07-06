@@ -1291,6 +1291,63 @@ def test_quality_pipeline_drops_candidate_when_local_edit_still_fails_gate():
     )
 
 
+def test_hero_preview_pipeline_uses_hero_profile_through_shared_skeleton():
+    """Hero preview must flow through the shared skeleton with hero-only labelling.
+
+    Locks the Task 3 refactor: execute_hero_preview is now a thin wrapper over
+    _execute_candidate_pipeline. The hero profile (forced closeup, hero_cand_
+    prefix, hero_preview_v1 version, 0.6 cost cap, 4 candidates) must reach the
+    metadata exactly as the old inline implementation produced.
+    """
+    w = _make_pipeline_worker([_judge_json(9)] * 4)
+    _fp, meta = w.execute_hero_preview(
+        "s_hero", "prompt", ["a.jpg"], "title", template_path=None
+    )
+
+    provider = w._gateway._provider_for("CREATE_FROM_REFERENCES")
+    assert provider.start_calls == 4  # HERO_PREVIEW_CANDIDATE_COUNT
+    assert meta["pipeline"] == "hero_preview_v1"
+    assert meta["shot_spec"]["shot_id"] == "closeup"  # force_closeup
+    assert meta["budget"]["initial_candidates"] == 4
+    assert meta["budget"]["max_total_api_cost"] == 0.6
+    assert [c["candidate_id"] for c in meta["candidates"]] == [
+        "hero_cand_1", "hero_cand_2", "hero_cand_3", "hero_cand_4",
+    ]
+    assert meta["provider_invocations"][0]["invocation_id"] == "hero_create_1"
+    assert meta["provider_invocations"][0]["prompt_version"] == "hero_preview_v1"
+    assert meta["shortlist"][0]["candidate_id"] == "hero_cand_1"
+    assert meta["face_swap"]["action"] == "none"
+
+
+def test_pipeline_forwards_session_feedback_to_policy_engine():
+    """Task 2: session_feedback must reach PolicyEngine.decide (was inert before).
+
+    Previously the call passed metadata["history"] (judge iterations with no
+    "event" field), so _feedback_modifier always returned 0.0. Now the
+    session's event-tagged feedback is threaded through verbatim.
+    """
+    w = _make_pipeline_worker([_judge_json(9), _judge_json(9), _judge_json(9)])
+    captured: list = []
+    real_decide = w._agent_router.decide
+
+    def spy_decide(judgement, **kwargs):
+        captured.append(kwargs.get("session_feedback"))
+        return real_decide(judgement, **kwargs)
+
+    w._agent_router.decide = spy_decide  # type: ignore[assignment]
+
+    feedback = [{"event": "not_like_me", "image_id": "img_x"}]
+    w.execute_generate_with_quality_pipeline(
+        "s_fb", "prompt", ["a.jpg"], "title",
+        template_path=None, session_feedback=feedback,
+    )
+
+    assert captured, "decide() was never called"
+    assert all(entry is feedback for entry in captured), (
+        "session_feedback was not forwarded verbatim to the policy engine"
+    )
+
+
 # Allow running without pytest: `python test_resemblance_loop.py`.
 if __name__ == "__main__":
     import traceback

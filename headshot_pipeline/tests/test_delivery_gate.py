@@ -183,6 +183,7 @@ class _RejectedWorker:
         template_path,
         progress_cb,
         shot_spec,
+        session_feedback=None,
     ):
         self.output_path.write_bytes(b"not-delivered")
         return str(self.output_path), _metadata(deliverable=False, hard_gates_pass=False)
@@ -201,6 +202,7 @@ class _DuplicateWorker:
         template_path,
         progress_cb,
         shot_spec,
+        session_feedback=None,
     ):
         _pattern_image(self.output_path)
         return str(self.output_path), _metadata(deliverable=True, hard_gates_pass=True)
@@ -219,6 +221,7 @@ class _AcceptedWorker:
         template_path,
         progress_cb,
         shot_spec,
+        session_feedback=None,
     ):
         _pattern_image(self.output_path, inverted=True)
         return str(self.output_path), _metadata(deliverable=True, hard_gates_pass=True)

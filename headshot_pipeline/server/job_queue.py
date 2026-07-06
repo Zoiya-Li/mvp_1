@@ -1637,6 +1637,7 @@ class JobQueue:
                     job.template_path,
                     progress_cb,
                     job.shot_spec,
+                    session.user_feedback,
                 )
 
             elif job.job_type == JobType.hero_preview:
@@ -1670,6 +1671,7 @@ class JobQueue:
                     job.template_path,
                     progress_cb,
                     job.shot_spec,
+                    session.user_feedback,
                 )
 
             elif job.job_type == JobType.revise:
@@ -1678,12 +1680,25 @@ class JobQueue:
                     f"{job.instruction}。"
                     "请保持人物面部特征不变，只修改上述要求的部分。"
                 )
+                # Resolve the parent image file the user is revising. The parent
+                # was delivered earlier so its file lives in output_dir; we still
+                # validate the id (path-traversal) and fall back to the canonical
+                # path if the file is momentarily absent (e.g. test fixtures) —
+                # local_edit will then surface a clear error if it's truly missing.
+                parent_image_id = job.revised_image_id or ""
+                source_path = self.get_image_path(session.session_id, parent_image_id)
+                if source_path is None:
+                    source_path = (
+                        session.output_dir
+                        / f"{safe_id(parent_image_id, label='image_id')}.png"
+                    )
                 revise_started_at = time.time()
                 filepath = await asyncio.to_thread(
                     self._worker.execute_revise,
                     job.session_id,
                     instruction,
                     f"{job.session_id}_rev_{job.turn}",
+                    str(source_path),
                 )
                 photos = [str(p) for p in session.uploaded_photos]
                 parent_img = find_registered_image(
@@ -1700,9 +1715,6 @@ class JobQueue:
                     if isinstance(parent_meta.get("shot_spec"), dict)
                     else None
                 )
-                worker_client = getattr(self._worker, "client", None)
-                if hasattr(worker_client, "_last_image_path"):
-                    worker_client._last_image_path = filepath
                 revision_judgement = await asyncio.to_thread(
                     self._worker._judge_current_candidate,
                     filepath,

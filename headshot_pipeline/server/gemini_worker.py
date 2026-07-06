@@ -13,6 +13,7 @@ import asyncio
 import json
 import re
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 from .config import settings
@@ -395,6 +396,59 @@ def build_shot_spec_metadata(prompt: str, title: str, template_path: str | None)
     return ShotSpec(**payload).model_dump(mode="json")
 
 
+@dataclass(frozen=True)
+class _PipelineProfile:
+    """Parameterization of the shared candidate pipeline.
+
+    Captures every behavioural difference between the hero preview and the
+    full-set quality pipeline so both can share one skeleton
+    (``_execute_candidate_pipeline``). Tunable knobs + labelling only; the
+    control flow (sample → judge → budgeted regenerate / local_edit /
+    identity_repair → select → delivery gate) is identical and lives once.
+    """
+
+    # ── Identity / naming ───────────────────────────────────────
+    prompt_version: str                       # metadata["pipeline"] + strategy.prompt_version
+
+    # ── Budget knobs ────────────────────────────────────────────
+    candidate_count: int
+    max_regenerations: int
+    max_local_edits: int
+    max_identity_repairs: int
+    max_total_api_cost: float
+
+    # ── Shot selection ──────────────────────────────────────────
+    force_closeup: bool                       # hero forces shot_id="closeup"
+
+    # ── Per-candidate identifier / title prefixes ───────────────
+    candidate_id_prefix: str                  # "cand_" | "hero_cand_"   → f"{prefix}{idx}"
+    create_inv_id_prefix: str                 # "create_" | "hero_create_"
+    regenerate_inv_id_prefix: str             # "regenerate_" | "hero_regenerate_"
+    local_edit_inv_id_prefix: str             # "local_edit_" | "hero_local_edit_"
+    identity_repair_inv_id_prefix: str        # "identity_repair_" | "hero_identity_repair_"
+    candidate_title_suffix: str               # "_cand" | "_hero_cand"  → f"{title}{suffix}{idx}"
+    regenerate_title_suffix: str              # "_regen" | "_hero_regen"
+
+    # ── Behavioural switches ────────────────────────────────────
+    drop_on_max_regenerations: bool           # full-set drops; hero does not
+    # When the local edit blows the budget, the full-set pipeline annotates the
+    # action with skip_reason; hero skips silently. Net effect (edit not applied)
+    # is identical either way.
+    mark_local_edit_skip_reason: bool
+
+    # ── Messages ────────────────────────────────────────────────
+    budget_exhausted_message: str
+    no_repair_message: str
+
+    # ── Progress-callback wording (human-facing only) ───────────
+    progress_candidate_word: str              # "candidate" | "hero preview"
+    progress_regenerate_word: str             # "from original references" | "hero preview"
+    progress_repair_repair: str
+    progress_repair_local_edit: str
+    progress_repair_accept: str
+    final_detail_prefix: str                  # "Selected candidate" | "Hero preview selected candidate"
+
+
 class GeminiWorker:
     """Wraps the image-generation gateway with session-aware pipeline management."""
 
@@ -471,523 +525,61 @@ class GeminiWorker:
         template_path: str | None = None,
         progress_callback=None,
         shot_spec_metadata: dict | None = None,
+        session_feedback: list[dict] | None = None,
     ) -> tuple[str, dict]:
-        """Generate a single high-quality hero preview with simplified pipeline.
+        """Generate a single high-quality hero preview with a simplified pipeline.
 
         Hero preview is the Aha Moment: one close-up portrait optimized for
         identity preservation and immediate user satisfaction. It uses a
-        stripped-down pipeline (1 candidate, 1 regen max, 1 repair max) to
+        stripped-down pipeline (fewer candidates, 1 regen/repair max) to
         minimize cost while maximizing first-impression quality.
+
+        ``session_feedback`` is the session's prior user feedback (event-tagged
+        records) used to condition the policy engine — see Task 2 wiring.
         """
-        self._ensure_session(session_id, photo_paths[0] if photo_paths else "")
-        self._turn_counts[session_id] = 1
-
-        ref_photos = photo_paths[:MAX_CHARACTER_REFERENCES]
-        eval_ref_photos = photo_paths[:MAX_IDENTITY_PACK_REFERENCES]
-        candidate_count = self.HERO_PREVIEW_CANDIDATE_COUNT
-        candidates: list[dict] = []
-        provider_invocations: list[dict] = []
-        agent_actions: list[dict] = []
-        identity_pack = build_identity_pack_metadata(eval_ref_photos)
-        shot_spec = shot_spec_metadata or build_shot_spec_metadata(
-            prompt, title, template_path
+        profile = _PipelineProfile(
+            prompt_version=self.HERO_PREVIEW_PROMPT_VERSION,
+            candidate_count=self.HERO_PREVIEW_CANDIDATE_COUNT,
+            max_regenerations=self.HERO_PREVIEW_MAX_REGENERATIONS,
+            max_local_edits=self.HERO_PREVIEW_MAX_LOCAL_EDITS,
+            max_identity_repairs=self.HERO_PREVIEW_MAX_IDENTITY_REPAIRS,
+            max_total_api_cost=self.HERO_PREVIEW_MAX_TOTAL_API_COST,
+            force_closeup=True,
+            candidate_id_prefix="hero_cand_",
+            create_inv_id_prefix="hero_create_",
+            regenerate_inv_id_prefix="hero_regenerate_",
+            local_edit_inv_id_prefix="hero_local_edit_",
+            identity_repair_inv_id_prefix="hero_identity_repair_",
+            candidate_title_suffix="_hero_cand",
+            regenerate_title_suffix="_hero_regen",
+            drop_on_max_regenerations=False,
+            mark_local_edit_skip_reason=False,
+            budget_exhausted_message="Hero preview candidate budget exhausted before generation",
+            no_repair_message="Hero preview QA accepted; no identity repair needed",
+            progress_candidate_word="hero preview",
+            progress_regenerate_word="hero preview",
+            progress_repair_repair="Applying identity repair to hero preview…",
+            progress_repair_local_edit="Applying local artifact edit…",
+            progress_repair_accept="Hero preview passed QA…",
+            final_detail_prefix="Hero preview selected candidate",
         )
-        # Force closeup profile for hero preview
-        shot_spec["shot_id"] = "closeup"
-        identity_thresholds = identity_threshold_profile(shot_spec)
-
-        metadata = {
-            "pipeline": "hero_preview_v1",
-            "iterations": 0,
-            "final_score": None,
-            "history": [],
-            "identity_pack": identity_pack,
-            "shot_spec": shot_spec,
-            "allowed_actions": PIPELINE_ALLOWED_ACTIONS,
-            "budget": {
-                "initial_candidates": candidate_count,
-                "max_regenerations": self.HERO_PREVIEW_MAX_REGENERATIONS,
-                "max_local_edits": self.HERO_PREVIEW_MAX_LOCAL_EDITS,
-                "max_identity_repairs": self.HERO_PREVIEW_MAX_IDENTITY_REPAIRS,
-                "max_total_api_cost": self.HERO_PREVIEW_MAX_TOTAL_API_COST,
-                "initial_candidates_generated": 0,
-                "regenerations_used": 0,
-                "local_edits_used": 0,
-                "identity_repairs_used": 0,
-                "estimated_cost_used": 0.0,
-            },
-            "strategy": {
-                "candidate_count": candidate_count,
-                "quality_accept_threshold": QUALITY_ACCEPT_THRESHOLD,
-                "identity_pass_threshold": identity_thresholds[
-                    "identity_pass_threshold"
-                ],
-                "identity_repair_threshold": identity_thresholds[
-                    "identity_repair_threshold"
-                ],
-                "identity_threshold_profile": identity_thresholds,
-                "reference_count": len(ref_photos),
-                "prompt_version": self.HERO_PREVIEW_PROMPT_VERSION,
-            },
-            "candidates": candidates,
-            "agent_actions": agent_actions,
-            "provider_invocations": provider_invocations,
-            "selected_candidate": None,
-            "shortlist": [],
-        }
-        reference_ids = [
-            f"ref_{idx + 1}"
-            for idx in range(len(ref_photos))
-        ]
-        reference_manifest = identity_pack_reference_manifest(
-            identity_pack,
-            set(reference_ids),
+        return self._execute_candidate_pipeline(
+            profile=profile,
+            session_id=session_id,
+            prompt=prompt,
+            photo_paths=photo_paths,
+            title=title,
+            template_path=template_path,
+            progress_callback=progress_callback,
+            shot_spec_metadata=shot_spec_metadata,
+            session_feedback=session_feedback,
         )
 
-        for idx in range(1, candidate_count + 1):
-            invocation_cost = estimate_cost(
-                "CREATE_FROM_REFERENCES", len(ref_photos)
-            )
-            if (
-                metadata["budget"]["estimated_cost_used"] + invocation_cost
-                > metadata["budget"]["max_total_api_cost"]
-            ):
-                agent_actions.append({
-                    "action": "DROP_CANDIDATE",
-                    "reason": "max_total_api_cost_reached",
-                    "candidate_id": None,
-                    "candidate_index": idx,
-                    "state": "BUDGET_CHECK",
-                    "executed": True,
-                })
-                break
+    # ── Shared candidate pipeline (hero preview + full set) ─────
 
-            if progress_callback:
-                progress_callback(
-                    idx, candidate_count, "candidate_generating",
-                    f"Generating hero preview {idx}/{candidate_count}…",
-                )
-
-            candidate_prompt = build_candidate_prompt(
-                prompt, len(ref_photos), idx, candidate_count
-            )
-            started_at = time.time()
-            filepath = self._gateway.create_from_references(
-                prompt=candidate_prompt,
-                reference_paths=ref_photos,
-                template_path=template_path,
-                title=f"{title}_hero_cand{idx}",
-                editing_mode=True,
-            )
-            invocation = build_provider_invocation_metadata(
-                invocation_id=f"hero_create_{idx}",
-                operation="CREATE_FROM_REFERENCES",
-                prompt_version=self.HERO_PREVIEW_PROMPT_VERSION,
-                reference_ids=reference_ids,
-                reference_roles=reference_manifest,
-                candidate_index=idx,
-                parent_candidate_id=None,
-                shot_id=shot_spec.get("shot_id"),
-                latency_ms=int((time.time() - started_at) * 1000),
-                cost=invocation_cost,
-                result_status="success",
-            )
-            provider_invocations.append(invocation)
-            metadata["budget"]["estimated_cost_used"] = round(
-                metadata["budget"]["estimated_cost_used"] + invocation_cost, 4
-            )
-
-            if progress_callback:
-                progress_callback(
-                    idx, candidate_count, "candidate_judging",
-                    f"Quality scoring hero preview {idx}/{candidate_count}…",
-                )
-
-            judgement = self._eval_service.judge_current_candidate(self._gateway, filepath, eval_ref_photos)
-            candidate = {
-                "index": idx,
-                "candidate_id": f"hero_cand_{idx}",
-                "path": filepath,
-                "filename": Path(filepath).name,
-                "judgement": judgement,
-                "aggregate_score": self._eval_service._aggregate_quality_score(judgement),
-                "gate_status": self._eval_service._candidate_gate_status(
-                    judgement,
-                    identity_thresholds,
-                ),
-                "provider_invocation_id": invocation["invocation_id"],
-                "selected": False,
-                "repair": None,
-            }
-            action = self._agent_router.decide(
-                judgement,
-                budget=metadata["budget"],
-                shot_spec=shot_spec,
-                session_feedback=metadata.get("history", []),
-                edit_count=0,
-                identity_repairs=0,
-                identity_thresholds=identity_thresholds,
-            )
-            candidate["agent_action"] = action
-            agent_actions.append({
-                **action,
-                "candidate_id": candidate["candidate_id"],
-                "candidate_index": idx,
-                "state": "EVALUATE",
-                "executed": False,
-            })
-            candidates.append(candidate)
-            metadata["budget"]["initial_candidates_generated"] = len(candidates)
-            metadata["history"].append({
-                "iteration": idx,
-                "score": judgement.get("scores", {}).get("identity"),
-                "feedback": judgement.get("notes"),
-                "raw_response": judgement.get("raw_response", "")[:500],
-                "accepted": False,
-            })
-
-        if not candidates:
-            raise RuntimeError("Hero preview candidate budget exhausted before generation")
-
-        selected = self._agent_router.select_candidate(candidates)
-        if selected is None:
-            selected = candidates[-1]
-
-        # One regeneration attempt if needed
-        while (
-            selected.get("agent_action", {}).get("action")
-            == "REGENERATE_FROM_ORIGINAL"
-            and metadata["budget"]["regenerations_used"]
-            < metadata["budget"]["max_regenerations"]
-        ):
-            regen_cost = estimate_cost("CREATE_FROM_REFERENCES", len(ref_photos))
-            if (
-                metadata["budget"]["estimated_cost_used"] + regen_cost
-                > metadata["budget"]["max_total_api_cost"]
-            ):
-                agent_actions.append({
-                    "action": "DROP_CANDIDATE",
-                    "reason": "max_total_api_cost_reached",
-                    "candidate_id": selected.get("candidate_id"),
-                    "candidate_index": selected.get("index"),
-                    "state": "BUDGET_CHECK",
-                    "executed": True,
-                })
-                break
-
-            for action_record in agent_actions:
-                if action_record.get("candidate_id") == selected.get("candidate_id"):
-                    action_record["executed"] = True
-                    action_record["selected_for_execution"] = True
-
-            metadata["budget"]["regenerations_used"] += 1
-            regen_no = metadata["budget"]["regenerations_used"]
-            idx = len(candidates) + 1
-            max_steps = candidate_count + metadata["budget"]["max_regenerations"]
-            if progress_callback:
-                progress_callback(
-                    idx, max_steps, "regenerating_from_original",
-                    f"Regenerating hero preview {regen_no}/"
-                    f"{metadata['budget']['max_regenerations']}…",
-                )
-
-            candidate_prompt = build_candidate_prompt(
-                prompt, len(ref_photos), idx, max_steps
-            )
-            started_at = time.time()
-            filepath = self._gateway.create_from_references(
-                prompt=candidate_prompt,
-                reference_paths=ref_photos,
-                template_path=template_path,
-                title=f"{title}_hero_regen{regen_no}",
-                editing_mode=True,
-            )
-            invocation = build_provider_invocation_metadata(
-                invocation_id=f"hero_regenerate_{regen_no}",
-                operation="CREATE_FROM_REFERENCES",
-                prompt_version=self.HERO_PREVIEW_PROMPT_VERSION,
-                reference_ids=reference_ids,
-                reference_roles=reference_manifest,
-                candidate_index=idx,
-                parent_candidate_id=selected.get("candidate_id"),
-                shot_id=shot_spec.get("shot_id"),
-                latency_ms=int((time.time() - started_at) * 1000),
-                cost=regen_cost,
-                result_status="success",
-            )
-            provider_invocations.append(invocation)
-            metadata["budget"]["estimated_cost_used"] = round(
-                metadata["budget"]["estimated_cost_used"] + regen_cost, 4
-            )
-
-            judgement = self._eval_service.judge_current_candidate(self._gateway, filepath, eval_ref_photos)
-            candidate = {
-                "index": idx,
-                "candidate_id": f"hero_cand_{idx}",
-                "path": filepath,
-                "filename": Path(filepath).name,
-                "judgement": judgement,
-                "aggregate_score": self._eval_service._aggregate_quality_score(judgement),
-                "gate_status": self._eval_service._candidate_gate_status(
-                    judgement,
-                    identity_thresholds,
-                ),
-                "provider_invocation_id": invocation["invocation_id"],
-                "selected": False,
-                "repair": None,
-                "regenerated_from_candidate_id": selected.get("candidate_id"),
-            }
-            action = self._agent_router.decide(
-                judgement,
-                budget=metadata["budget"],
-                shot_spec=shot_spec,
-                session_feedback=metadata.get("history", []),
-                edit_count=0,
-                identity_repairs=0,
-                identity_thresholds=identity_thresholds,
-            )
-            candidate["agent_action"] = action
-            agent_actions.append({
-                **action,
-                "candidate_id": candidate["candidate_id"],
-                "candidate_index": idx,
-                "state": "EVALUATE",
-                "executed": False,
-            })
-            candidates.append(candidate)
-            metadata["history"].append({
-                "iteration": idx,
-                "score": judgement.get("scores", {}).get("identity"),
-                "feedback": judgement.get("notes"),
-                "raw_response": judgement.get("raw_response", "")[:500],
-                "accepted": False,
-                "regenerated_from_candidate_id": selected.get("candidate_id"),
-            })
-
-            selected = self._agent_router.select_candidate(candidates) or candidate
-
-        # Apply local edit or identity repair if needed
-        selected["selected"] = True
-        filepath = selected["path"]
-        selected_scores = selected.get("judgement", {}).get("scores", {})
-        selected_identity = selected_scores.get("identity")
-        selected_action = selected.get("agent_action", {})
-        local_edit_needed = selected_action.get("action") == "LOCAL_EDIT"
-        repair_needed = (
-            selected_action.get("action") == "IDENTITY_REPAIR"
-            or self._agent_router.should_apply_identity_repair(
-                selected.get("judgement", {}),
-                identity_thresholds,
-            )
-        )
-        for action_record in agent_actions:
-            if action_record.get("candidate_id") == selected.get("candidate_id"):
-                action_record["selected_for_execution"] = True
-
-        if progress_callback:
-            progress_callback(
-                selected["index"], candidate_count, "repairing",
-                (
-                    "Applying identity repair to hero preview…"
-                    if repair_needed
-                    else "Applying local artifact edit…"
-                    if local_edit_needed
-                    else "Hero preview passed QA…"
-                ),
-            )
-
-        if local_edit_needed:
-            local_edit_cost = estimate_cost("LOCAL_EDIT", len(ref_photos))
-            if (
-                metadata["budget"]["estimated_cost_used"] + local_edit_cost
-                <= metadata["budget"]["max_total_api_cost"]
-            ):
-                started_at = time.time()
-                edit_prompt = build_local_edit_prompt(selected.get("judgement", {}))
-                edited_path = self._gateway.local_edit(
-                    current_image_path=filepath,
-                    reference_paths=ref_photos,
-                    edit_prompt=edit_prompt,
-                    title=f"{title}_hero_cand{selected['index']}_local_edit",
-                )
-                filepath = edited_path
-                metadata["budget"]["local_edits_used"] += 1
-                local_invocation = build_provider_invocation_metadata(
-                    invocation_id=f"hero_local_edit_{selected['index']}",
-                    operation="LOCAL_EDIT",
-                    prompt_version=self.HERO_PREVIEW_PROMPT_VERSION,
-                    reference_ids=reference_ids,
-                    reference_roles=reference_manifest,
-                    candidate_index=selected["index"],
-                    parent_candidate_id=selected["candidate_id"],
-                    shot_id=shot_spec.get("shot_id"),
-                    latency_ms=int((time.time() - started_at) * 1000),
-                    cost=local_edit_cost,
-                    result_status="success",
-                )
-                provider_invocations.append(local_invocation)
-                metadata["budget"]["estimated_cost_used"] = round(
-                    metadata["budget"]["estimated_cost_used"] + local_edit_cost, 4
-                )
-                edited_judgement = self._eval_service.judge_current_candidate(self._gateway, 
-                    filepath,
-                    eval_ref_photos,
-                )
-                selected["local_edit"] = {
-                    "action": "local_edit",
-                    "applied": True,
-                    "output_filename": Path(filepath).name,
-                    "post_edit_judgement": edited_judgement,
-                }
-                selected["aggregate_score"] = self._eval_service._aggregate_quality_score(
-                    edited_judgement
-                )
-                selected["gate_status"] = self._eval_service._candidate_gate_status(
-                    edited_judgement,
-                    identity_thresholds,
-                )
-                selected_scores = edited_judgement.get("scores", {})
-                selected_identity = selected_scores.get("identity")
-                repair_needed = self._should_apply_identity_repair(
-                    edited_judgement,
-                    identity_thresholds,
-                )
-
-        if repair_needed:
-            swap_result = self._apply_face_swap(filepath, photo_paths, title)
-            if swap_result.swapped:
-                metadata["budget"]["identity_repairs_used"] += 1
-                filepath = str(swap_result.output_path)
-                selected["repair"] = self._public_repair_metadata(
-                    "face_swap", swap_result
-                )
-                repair_invocation = build_provider_invocation_metadata(
-                    invocation_id=f"hero_identity_repair_{selected['index']}",
-                    operation="IDENTITY_REPAIR",
-                    prompt_version=None,
-                    reference_ids=reference_ids,
-                    reference_roles=reference_manifest,
-                    candidate_index=selected["index"],
-                    parent_candidate_id=selected["candidate_id"],
-                    shot_id=shot_spec.get("shot_id"),
-                    latency_ms=None,
-                    cost=estimate_cost("IDENTITY_REPAIR", len(ref_photos)),
-                    result_status="success",
-                )
-                provider_invocations.append(repair_invocation)
-                metadata["budget"]["estimated_cost_used"] = round(
-                    metadata["budget"]["estimated_cost_used"]
-                    + repair_invocation["estimated_cost"],
-                    4,
-                )
-                repaired_judgement = self._eval_service.judge_current_candidate(self._gateway, 
-                    filepath,
-                    eval_ref_photos,
-                )
-                selected["repair"]["post_repair_judgement"] = repaired_judgement
-                selected["aggregate_score"] = self._eval_service._aggregate_quality_score(
-                    repaired_judgement
-                )
-                selected["gate_status"] = self._eval_service._candidate_gate_status(
-                    repaired_judgement,
-                    identity_thresholds,
-                )
-                selected_scores = repaired_judgement.get("scores", {})
-                selected_identity = selected_scores.get("identity")
-            else:
-                selected["repair"] = self._public_repair_metadata(
-                    "face_swap", swap_result
-                )
-        else:
-            selected["repair"] = {
-                "action": "none",
-                "applied": False,
-                "message": "Hero preview QA accepted; no identity repair needed",
-            }
-
-        final_gate = selected.get("gate_status", {}) or {}
-        selected_has_terminal_drop = any(
-            action_record.get("candidate_id") == selected.get("candidate_id")
-            and action_record.get("action") == "DROP_CANDIDATE"
-            and action_record.get("executed") is True
-            for action_record in agent_actions
-        )
-        if not final_gate.get("hard_gates_pass") and not selected_has_terminal_drop:
-            local_edit_applied = selected.get("local_edit", {}).get("applied")
-            repair_applied = selected.get("repair", {}).get("applied")
-            if local_edit_applied or repair_applied:
-                agent_actions.append({
-                    "action": "DROP_CANDIDATE",
-                    "reason": (
-                        "local_edit_failed_delivery_gate"
-                        if local_edit_applied
-                        else "identity_repair_failed_delivery_gate"
-                    ),
-                    "candidate_id": selected.get("candidate_id"),
-                    "candidate_index": selected.get("index"),
-                    "state": "FINAL_EVALUATE",
-                    "hard_gate_failures": final_gate.get("hard_gate_failures", []),
-                    "executed": True,
-                    "selected_for_execution": True,
-                })
-
-        for action_record in agent_actions:
-            if action_record.get("candidate_id") != selected.get("candidate_id"):
-                continue
-            if action_record.get("action") == "DROP_CANDIDATE":
-                continue
-            action_record["executed"] = bool(
-                (
-                    repair_needed
-                    and selected.get("repair", {}).get("applied")
-                )
-                or (
-                    action_record.get("action") == "LOCAL_EDIT"
-                    and selected.get("local_edit", {}).get("applied")
-                )
-            )
-            if not repair_needed and action_record.get("action") == "ACCEPT":
-                action_record["executed"] = True
-
-        final_score = selected_identity
-        metadata["iterations"] = len(candidates)
-        metadata["final_score"] = final_score
-        metadata["selected_candidate"] = {
-            "index": selected["index"],
-            "candidate_id": selected["candidate_id"],
-            "filename": Path(filepath).name,
-            "aggregate_score": selected["aggregate_score"],
-            "identity_score": final_score,
-            "gate_status": selected.get("gate_status"),
-            "deliverable": bool(
-                selected.get("gate_status", {}).get("hard_gates_pass")
-            ),
-        }
-        metadata["shortlist"] = self._agent_router.candidate_shortlist(candidates, limit=2)
-        metadata["face_swap"] = selected["repair"]
-        if selected.get("local_edit"):
-            metadata["local_edit"] = selected["local_edit"]
-        for candidate in candidates:
-            candidate.pop("path", None)
-        for record in metadata["history"]:
-            if record["iteration"] == selected["index"]:
-                record["accepted"] = True
-
-        if progress_callback:
-            detail = (
-                f"Hero preview selected candidate {selected['index']}/{candidate_count}"
-                + (f" · identity {final_score}/10" if final_score is not None else "")
-            )
-            progress_callback(
-                selected["index"], candidate_count, "accepted", detail
-            )
-
-        return filepath, metadata
-
-    # ── Controlled candidate pipeline ─────────────────────────
-
-    def execute_generate_with_quality_pipeline(
+    def _execute_candidate_pipeline(
         self,
+        profile: _PipelineProfile,
         session_id: str,
         prompt: str,
         photo_paths: list[str],
@@ -995,25 +587,27 @@ class GeminiWorker:
         template_path: str | None = None,
         progress_callback=None,
         shot_spec_metadata: dict | None = None,
+        session_feedback: list[dict] | None = None,
     ) -> tuple[str, dict]:
-        """Generate a small candidate set, QA-score it, repair once, then select.
+        """Shared candidate-generation skeleton.
 
-        This is the product pipeline:
-          1. Generate N constrained candidates from the same template.
-          2. Ask a structured judge for identity/style/artifact scores.
-          3. Select the best candidate instead of revising in free text.
-          4. Apply deterministic face-swap identity repair to the selected image.
+        Flow: sample N candidates → judge each → budgeted regenerate /
+        local_edit / identity_repair on the selected candidate → final delivery
+        gate. Both execute_hero_preview and execute_generate_with_quality_pipeline
+        delegate here; ``profile`` carries every difference between them.
 
-        The old resemblance loop remains below as a legacy fallback and for
-        tests, but production should prefer this method because it turns the
-        image model's randomness into a controlled sampling-and-selection step.
+        ``session_feedback`` (event-tagged user-feedback records, e.g.
+        ``{"event": "not_like_me"}``) conditions the policy engine's ACCEPT vs
+        regenerate lean — this is the intra-session feedback signal that was
+        previously inert (the old call passed judge-iteration history, which
+        carries no ``event`` field, so the modifier was always 0).
         """
         self._ensure_session(session_id, photo_paths[0] if photo_paths else "")
         self._turn_counts[session_id] = 1
 
         ref_photos = photo_paths[:MAX_CHARACTER_REFERENCES]
         eval_ref_photos = photo_paths[:MAX_IDENTITY_PACK_REFERENCES]
-        candidate_count = PIPELINE_CANDIDATE_COUNT
+        candidate_count = profile.candidate_count
         candidates: list[dict] = []
         provider_invocations: list[dict] = []
         agent_actions: list[dict] = []
@@ -1021,10 +615,13 @@ class GeminiWorker:
         shot_spec = shot_spec_metadata or build_shot_spec_metadata(
             prompt, title, template_path
         )
+        if profile.force_closeup:
+            shot_spec["shot_id"] = "closeup"
         identity_thresholds = identity_threshold_profile(shot_spec)
+        cand_word = profile.progress_candidate_word
 
         metadata = {
-            "pipeline": "controlled_candidate_v2",
+            "pipeline": profile.prompt_version,
             # Compatibility with the old frontend/storage wording.
             "iterations": 0,
             "final_score": None,
@@ -1034,10 +631,10 @@ class GeminiWorker:
             "allowed_actions": PIPELINE_ALLOWED_ACTIONS,
             "budget": {
                 "initial_candidates": candidate_count,
-                "max_regenerations": MAX_PIPELINE_REGENERATIONS,
-                "max_local_edits": MAX_PIPELINE_LOCAL_EDITS,
-                "max_identity_repairs": MAX_PIPELINE_IDENTITY_REPAIRS,
-                "max_total_api_cost": MAX_PIPELINE_TOTAL_API_COST,
+                "max_regenerations": profile.max_regenerations,
+                "max_local_edits": profile.max_local_edits,
+                "max_identity_repairs": profile.max_identity_repairs,
+                "max_total_api_cost": profile.max_total_api_cost,
                 "initial_candidates_generated": 0,
                 "regenerations_used": 0,
                 "local_edits_used": 0,
@@ -1055,7 +652,7 @@ class GeminiWorker:
                 ],
                 "identity_threshold_profile": identity_thresholds,
                 "reference_count": len(ref_photos),
-                "prompt_version": PIPELINE_PROMPT_VERSION,
+                "prompt_version": profile.prompt_version,
             },
             "candidates": candidates,
             "agent_actions": agent_actions,
@@ -1072,6 +669,7 @@ class GeminiWorker:
             set(reference_ids),
         )
 
+        # ── 1. Initial candidate sampling ───────────────────────────
         for idx in range(1, candidate_count + 1):
             invocation_cost = estimate_cost(
                 "CREATE_FROM_REFERENCES", len(ref_photos)
@@ -1093,7 +691,7 @@ class GeminiWorker:
             if progress_callback:
                 progress_callback(
                     idx, candidate_count, "candidate_generating",
-                    f"Generating candidate {idx}/{candidate_count}…",
+                    f"Generating {cand_word} {idx}/{candidate_count}…",
                 )
 
             candidate_prompt = build_candidate_prompt(
@@ -1104,13 +702,13 @@ class GeminiWorker:
                 prompt=candidate_prompt,
                 reference_paths=ref_photos,
                 template_path=template_path,
-                title=f"{title}_cand{idx}",
+                title=f"{title}{profile.candidate_title_suffix}{idx}",
                 editing_mode=True,
             )
             invocation = build_provider_invocation_metadata(
-                invocation_id=f"create_{idx}",
+                invocation_id=f"{profile.create_inv_id_prefix}{idx}",
                 operation="CREATE_FROM_REFERENCES",
-                prompt_version=PIPELINE_PROMPT_VERSION,
+                prompt_version=profile.prompt_version,
                 reference_ids=reference_ids,
                 reference_roles=reference_manifest,
                 candidate_index=idx,
@@ -1128,13 +726,13 @@ class GeminiWorker:
             if progress_callback:
                 progress_callback(
                     idx, candidate_count, "candidate_judging",
-                    f"Quality scoring candidate {idx}/{candidate_count}…",
+                    f"Quality scoring {cand_word} {idx}/{candidate_count}…",
                 )
 
             judgement = self._eval_service.judge_current_candidate(self._gateway, filepath, eval_ref_photos)
             candidate = {
                 "index": idx,
-                "candidate_id": f"cand_{idx}",
+                "candidate_id": f"{profile.candidate_id_prefix}{idx}",
                 "path": filepath,
                 "filename": Path(filepath).name,
                 "judgement": judgement,
@@ -1151,7 +749,7 @@ class GeminiWorker:
                 judgement,
                 budget=metadata["budget"],
                 shot_spec=shot_spec,
-                session_feedback=metadata.get("history", []),
+                session_feedback=session_feedback,
                 edit_count=0,
                 identity_repairs=0,
                 identity_thresholds=identity_thresholds,
@@ -1175,7 +773,7 @@ class GeminiWorker:
             })
 
         if not candidates:
-            raise RuntimeError("Initial candidate budget exhausted before generation")
+            raise RuntimeError(profile.budget_exhausted_message)
 
         selected = self._agent_router.select_candidate(candidates)
         if selected is None:
@@ -1184,6 +782,7 @@ class GeminiWorker:
             # than failing the paid flow after a judge-format problem.
             selected = candidates[-1]
 
+        # ── 2. Bounded regeneration from original references ─────────
         while (
             selected.get("agent_action", {}).get("action")
             == "REGENERATE_FROM_ORIGINAL"
@@ -1217,7 +816,7 @@ class GeminiWorker:
             if progress_callback:
                 progress_callback(
                     idx, max_steps, "regenerating_from_original",
-                    f"Regenerating from original references {regen_no}/"
+                    f"Regenerating {profile.progress_regenerate_word} {regen_no}/"
                     f"{metadata['budget']['max_regenerations']}…",
                 )
 
@@ -1229,13 +828,13 @@ class GeminiWorker:
                 prompt=candidate_prompt,
                 reference_paths=ref_photos,
                 template_path=template_path,
-                title=f"{title}_regen{regen_no}",
+                title=f"{title}{profile.regenerate_title_suffix}{regen_no}",
                 editing_mode=True,
             )
             invocation = build_provider_invocation_metadata(
-                invocation_id=f"regenerate_{regen_no}",
+                invocation_id=f"{profile.regenerate_inv_id_prefix}{regen_no}",
                 operation="CREATE_FROM_REFERENCES",
-                prompt_version=PIPELINE_PROMPT_VERSION,
+                prompt_version=profile.prompt_version,
                 reference_ids=reference_ids,
                 reference_roles=reference_manifest,
                 candidate_index=idx,
@@ -1253,7 +852,7 @@ class GeminiWorker:
             judgement = self._eval_service.judge_current_candidate(self._gateway, filepath, eval_ref_photos)
             candidate = {
                 "index": idx,
-                "candidate_id": f"cand_{idx}",
+                "candidate_id": f"{profile.candidate_id_prefix}{idx}",
                 "path": filepath,
                 "filename": Path(filepath).name,
                 "judgement": judgement,
@@ -1271,7 +870,7 @@ class GeminiWorker:
                 judgement,
                 budget=metadata["budget"],
                 shot_spec=shot_spec,
-                session_feedback=metadata.get("history", []),
+                session_feedback=session_feedback,
                 edit_count=0,
                 identity_repairs=0,
                 identity_thresholds=identity_thresholds,
@@ -1297,7 +896,8 @@ class GeminiWorker:
             selected = self._agent_router.select_candidate(candidates) or candidate
 
         if (
-            selected.get("agent_action", {}).get("action")
+            profile.drop_on_max_regenerations
+            and selected.get("agent_action", {}).get("action")
             == "REGENERATE_FROM_ORIGINAL"
             and metadata["budget"]["regenerations_used"]
             >= metadata["budget"]["max_regenerations"]
@@ -1312,6 +912,7 @@ class GeminiWorker:
                 "selected_for_execution": True,
             })
 
+        # ── 3. Local edit / identity repair of the selected candidate ─
         selected["selected"] = True
         filepath = selected["path"]
         selected_scores = selected.get("judgement", {}).get("scores", {})
@@ -1333,11 +934,11 @@ class GeminiWorker:
             progress_callback(
                 selected["index"], candidate_count, "repairing",
                 (
-                    "Applying identity repair and final checks…"
+                    profile.progress_repair_repair
                     if repair_needed
-                    else "Applying local artifact edit and final checks…"
+                    else profile.progress_repair_local_edit
                     if local_edit_needed
-                    else "Candidate passed QA; skipping identity repair…"
+                    else profile.progress_repair_accept
                 ),
             )
 
@@ -1348,10 +949,11 @@ class GeminiWorker:
                 > metadata["budget"]["max_total_api_cost"]
             ):
                 local_edit_needed = False
-                for action_record in agent_actions:
-                    if action_record.get("candidate_id") == selected.get("candidate_id"):
-                        action_record["executed"] = False
-                        action_record["skip_reason"] = "max_total_api_cost_reached"
+                if profile.mark_local_edit_skip_reason:
+                    for action_record in agent_actions:
+                        if action_record.get("candidate_id") == selected.get("candidate_id"):
+                            action_record["executed"] = False
+                            action_record["skip_reason"] = "max_total_api_cost_reached"
 
         if local_edit_needed:
             started_at = time.time()
@@ -1360,14 +962,14 @@ class GeminiWorker:
                 current_image_path=filepath,
                 reference_paths=ref_photos,
                 edit_prompt=edit_prompt,
-                title=f"{title}_cand{selected['index']}_local_edit",
+                title=f"{title}{profile.candidate_title_suffix}{selected['index']}_local_edit",
             )
             filepath = edited_path
             metadata["budget"]["local_edits_used"] += 1
             local_invocation = build_provider_invocation_metadata(
-                invocation_id=f"local_edit_{selected['index']}",
+                invocation_id=f"{profile.local_edit_inv_id_prefix}{selected['index']}",
                 operation="LOCAL_EDIT",
-                prompt_version=PIPELINE_PROMPT_VERSION,
+                prompt_version=profile.prompt_version,
                 reference_ids=reference_ids,
                 reference_roles=reference_manifest,
                 candidate_index=selected["index"],
@@ -1381,7 +983,7 @@ class GeminiWorker:
             metadata["budget"]["estimated_cost_used"] = round(
                 metadata["budget"]["estimated_cost_used"] + local_edit_cost, 4
             )
-            edited_judgement = self._eval_service.judge_current_candidate(self._gateway, 
+            edited_judgement = self._eval_service.judge_current_candidate(self._gateway,
                 filepath,
                 eval_ref_photos,
             )
@@ -1417,7 +1019,7 @@ class GeminiWorker:
                     "face_swap", swap_result
                 )
                 repair_invocation = build_provider_invocation_metadata(
-                    invocation_id=f"identity_repair_{selected['index']}",
+                    invocation_id=f"{profile.identity_repair_inv_id_prefix}{selected['index']}",
                     operation="IDENTITY_REPAIR",
                     prompt_version=None,
                     reference_ids=reference_ids,
@@ -1436,7 +1038,7 @@ class GeminiWorker:
                     4,
                 )
                 # Re-score the repaired image when possible.
-                repaired_judgement = self._eval_service.judge_current_candidate(self._gateway, 
+                repaired_judgement = self._eval_service.judge_current_candidate(self._gateway,
                     filepath,
                     eval_ref_photos,
                 )
@@ -1458,9 +1060,10 @@ class GeminiWorker:
             selected["repair"] = {
                 "action": "none",
                 "applied": False,
-                "message": "QA accepted candidate; no identity repair needed",
+                "message": profile.no_repair_message,
             }
 
+        # ── 4. Final delivery-gate evaluation ────────────────────────
         final_gate = selected.get("gate_status", {}) or {}
         selected_has_terminal_drop = any(
             action_record.get("candidate_id") == selected.get("candidate_id")
@@ -1531,7 +1134,7 @@ class GeminiWorker:
 
         if progress_callback:
             detail = (
-                f"Selected candidate {selected['index']}/{candidate_count}"
+                f"{profile.final_detail_prefix} {selected['index']}/{candidate_count}"
                 + (f" · identity {final_score}/10" if final_score is not None else "")
             )
             progress_callback(
@@ -1539,6 +1142,69 @@ class GeminiWorker:
             )
 
         return filepath, metadata
+
+    # ── Controlled candidate pipeline (full set) ───────────────
+
+    def execute_generate_with_quality_pipeline(
+        self,
+        session_id: str,
+        prompt: str,
+        photo_paths: list[str],
+        title: str,
+        template_path: str | None = None,
+        progress_callback=None,
+        shot_spec_metadata: dict | None = None,
+        session_feedback: list[dict] | None = None,
+    ) -> tuple[str, dict]:
+        """Generate a small candidate set, QA-score it, repair once, then select.
+
+        This is the product pipeline:
+          1. Generate N constrained candidates from the same template.
+          2. Ask a structured judge for identity/style/artifact scores.
+          3. Select the best candidate instead of revising in free text.
+          4. Apply deterministic face-swap identity repair to the selected image.
+
+        ``session_feedback`` is the session's prior user feedback (event-tagged
+        records) used to condition the policy engine.
+        """
+        profile = _PipelineProfile(
+            prompt_version=PIPELINE_PROMPT_VERSION,
+            candidate_count=PIPELINE_CANDIDATE_COUNT,
+            max_regenerations=MAX_PIPELINE_REGENERATIONS,
+            max_local_edits=MAX_PIPELINE_LOCAL_EDITS,
+            max_identity_repairs=MAX_PIPELINE_IDENTITY_REPAIRS,
+            max_total_api_cost=MAX_PIPELINE_TOTAL_API_COST,
+            force_closeup=False,
+            candidate_id_prefix="cand_",
+            create_inv_id_prefix="create_",
+            regenerate_inv_id_prefix="regenerate_",
+            local_edit_inv_id_prefix="local_edit_",
+            identity_repair_inv_id_prefix="identity_repair_",
+            candidate_title_suffix="_cand",
+            regenerate_title_suffix="_regen",
+            drop_on_max_regenerations=True,
+            mark_local_edit_skip_reason=True,
+            budget_exhausted_message="Initial candidate budget exhausted before generation",
+            no_repair_message="QA accepted candidate; no identity repair needed",
+            progress_candidate_word="candidate",
+            progress_regenerate_word="from original references",
+            progress_repair_repair="Applying identity repair and final checks…",
+            progress_repair_local_edit="Applying local artifact edit and final checks…",
+            progress_repair_accept="Candidate passed QA; skipping identity repair…",
+            final_detail_prefix="Selected candidate",
+        )
+        return self._execute_candidate_pipeline(
+            profile=profile,
+            session_id=session_id,
+            prompt=prompt,
+            photo_paths=photo_paths,
+            title=title,
+            template_path=template_path,
+            progress_callback=progress_callback,
+            shot_spec_metadata=shot_spec_metadata,
+            session_feedback=session_feedback,
+        )
+
 
     @staticmethod
     def _public_repair_metadata(action: str, result: FaceSwapResult) -> dict:
@@ -1883,8 +1549,15 @@ class GeminiWorker:
         session_id: str,
         instruction: str,
         title: str,
+        source_image_path: str,
     ) -> str:
-        """Run a revision job in the same conversation. Returns path to saved image."""
+        """Run a bounded local-edit revision on a delivered parent image.
+
+        ``source_image_path`` is the on-disk path of the parent image being
+        retouched (resolved and path-traversal-checked by the caller). The edit
+        is a LOCAL_EDIT — it retouches the existing image rather than
+        regenerating from scratch, so identity is preserved.
+        """
         if self.active_session_id != session_id:
             raise RuntimeError(
                 f"Session {session_id} is not the active conversation "
@@ -1896,12 +1569,29 @@ class GeminiWorker:
         self._turn_counts[session_id] = turn
 
         filepath = self._gateway.local_edit(
-            current_image_path=filepath,
+            current_image_path=source_image_path,
             reference_paths=[],
             edit_prompt=instruction,
             title=title,
         )
         return filepath
+
+    def _judge_current_candidate(
+        self,
+        image_path: str,
+        reference_photo_paths: list[str] | None = None,
+    ) -> dict:
+        """Judge a revised image through the worker's evaluator + gateway.
+
+        Thin delegate so callers (job_queue revise path) can ask the worker to
+        score an image without knowing about EvaluationService/ImageGateway
+        wiring. Mirrors the judge step used inside the candidate pipelines.
+        """
+        return self._eval_service.judge_current_candidate(
+            self._gateway,
+            image_path,
+            reference_photo_paths or [],
+        )
 
     def end_session(self, session_id: str):
         """End the conversation for a session."""

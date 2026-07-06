@@ -35,7 +35,7 @@ class _RevisionWorker:
         self.output_path = output_path
         self.judgement = judgement or _revision_judgement()
 
-    def execute_revise(self, session_id, instruction, title):
+    def execute_revise(self, session_id, instruction, title, source_image_path):
         Image = pytest.importorskip("PIL.Image")
         Image.new("RGB", (240, 160), color=(80, 120, 160)).save(
             self.output_path, format="PNG"
@@ -235,3 +235,104 @@ async def test_revision_delivery_gate_failure_is_not_saved_to_gallery(tmp_path):
     assert len(state.generated_images) == 1
     assert state.generated_images[0].image_id == parent.image_id
     assert "Final gate" in job.error
+
+
+# -- Real GeminiWorker revise-path coverage ----------------------------------
+# The tests above use _RevisionWorker, a hand-written fake whose
+# execute_revise / _judge_current_candidate signatures mask the two production
+# bugs they were written against (NameError on undefined `filepath`, and the
+# AttributeError from a nonexistent `_judge_current_candidate` on GeminiWorker).
+# The tests below exercise the REAL GeminiWorker methods to lock the fixes in.
+
+
+def _real_revise_worker(tmp_path):
+    """Build a real GeminiWorker with a fake gateway + evaluator, via __new__."""
+    from server.gemini_worker import GeminiWorker
+    from server.evaluation.evaluator import EvaluationService
+
+    w = GeminiWorker.__new__(GeminiWorker)
+    w.active_session_id = "s_revision"
+    w._turn_counts = {}
+
+    class _SpyGateway:
+        def __init__(self):
+            self.local_edit_calls = []
+            self.judge_calls = []
+
+        def local_edit(self, current_image_path, reference_paths, edit_prompt, title):
+            self.local_edit_calls.append({
+                "current_image_path": current_image_path,
+                "reference_paths": list(reference_paths),
+                "edit_prompt": edit_prompt,
+                "title": title,
+            })
+            return str(tmp_path / "revised.png")
+
+        def judge(self, current_image_path, reference_paths, judge_prompt, timeout=None):
+            self.judge_calls.append({
+                "current_image_path": current_image_path,
+                "reference_paths": list(reference_paths),
+            })
+            return '{"scores":{"identity":9},"hard_failures":[],"notes":"ok"}'
+
+        def end_session(self):
+            pass
+
+    spy = _SpyGateway()
+    w._gateway = spy
+    w._eval_service = EvaluationService()
+    return w, spy
+
+
+def test_real_execute_revise_uses_source_image_path_not_undefined(tmp_path):
+    """Regression: execute_revise referenced `filepath` before assignment.
+
+    The local_edit call must now receive the resolved parent path as
+    current_image_path, not an undefined local. references stay empty by design.
+    """
+    w, spy = _real_revise_worker(tmp_path)
+
+    out = w.execute_revise(
+        "s_revision",
+        "Make the lighting brighter",
+        "s_revision_rev_2",
+        source_image_path=str(tmp_path / "parent.png"),
+    )
+
+    assert out == str(tmp_path / "revised.png")
+    assert len(spy.local_edit_calls) == 1
+    call = spy.local_edit_calls[0]
+    assert call["current_image_path"] == str(tmp_path / "parent.png")
+    assert call["reference_paths"] == []
+    assert call["edit_prompt"] == "Make the lighting brighter"
+    assert call["title"] == "s_revision_rev_2"
+    # Turn counter advanced.
+    assert w._turn_counts["s_revision"] == 2
+
+
+def test_real_worker_has_judge_current_candidate_delegate(tmp_path):
+    """Regression: GeminiWorker had no _judge_current_candidate, so the job_queue
+    revise path raised AttributeError. It now delegates to the eval service."""
+    w, spy = _real_revise_worker(tmp_path)
+
+    judgement = w._judge_current_candidate(
+        str(tmp_path / "revised.png"),
+        ["ref1.jpg", "ref2.jpg"],
+    )
+
+    assert isinstance(judgement, dict)
+    assert spy.judge_calls[0]["current_image_path"] == str(tmp_path / "revised.png")
+    assert spy.judge_calls[0]["reference_paths"] == ["ref1.jpg", "ref2.jpg"]
+
+
+def test_real_execute_revise_rejects_inactive_session(tmp_path):
+    w, _spy = _real_revise_worker(tmp_path)
+    w.active_session_id = "other_session"
+
+    with pytest.raises(RuntimeError, match="not the active conversation"):
+        w.execute_revise(
+            "s_revision",
+            "brighter",
+            "t",
+            source_image_path=str(tmp_path / "parent.png"),
+        )
