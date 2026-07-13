@@ -8,6 +8,7 @@ from datetime import timedelta
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from . import storage
 from .config import settings
@@ -45,16 +46,34 @@ async def _retention_sweep():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup: init the OpenRouter Gemini worker. Shutdown: stop."""
+    """Startup: initialize the configured image worker. Shutdown: stop."""
     print("🚀 Starting FlashShot API server...")
-    print(f"   Gemini model: {settings.gemini_model}")
-    print(f"   OpenRouter key: {'set' if settings.openrouter_api_key else 'MISSING — generation will fail'}")
+    active_model = (
+        settings.siliconflow_image_model
+        if settings.gemini_backend == "siliconflow"
+        else settings.gemini_model
+        if settings.gemini_backend == "openrouter"
+        else "gemini-web-ui"
+    )
+    print(f"   Image model: {active_model}")
+    provider_key_set = (
+        bool(settings.siliconflow_api_key)
+        if settings.gemini_backend == "siliconflow"
+        else bool(settings.openrouter_api_key)
+        if settings.gemini_backend == "openrouter"
+        else True
+    )
+    print(f"   Image backend: {settings.gemini_backend}")
+    print(f"   Provider key: {'set' if provider_key_set else 'MISSING — generation will fail'}")
     print(f"   Data dir: {settings.data_dir}")
     print(f"   Payment mock: {'ON (dev only)' if settings.payment_mock_enabled else 'OFF'}")
     print(f"   Paddle: {'configured' if PaymentService.is_paddle_configured() else 'NOT configured (mock or dev)'}")
 
     await queue.start()
-    print("✓ Worker started")
+    if queue.generation_ready:
+        print("✓ Generation worker ready")
+    else:
+        print("⚠ API started without a generation-ready worker")
 
     sweep_task = asyncio.create_task(_retention_sweep())
 
@@ -96,7 +115,50 @@ async def health():
         "status": "ok",
         "queue_length": queue.queue_length(),
         "is_busy": queue.is_busy,
+        "generation_ready": queue.generation_ready,
     }
+
+
+@app.get("/api/ready")
+async def ready():
+    """Strict release/load-balancer readiness, including production config."""
+    config_errors = settings.production_readiness_errors()
+    checks = {
+        "generation_worker": queue.generation_ready,
+        "production_config": not config_errors,
+    }
+    is_ready = all(checks.values())
+    return JSONResponse(
+        status_code=200 if is_ready else 503,
+        content={
+            "status": "ready" if is_ready else "not_ready",
+            "checks": checks,
+            "configuration_errors": config_errors,
+            "provider_error": queue.worker_readiness_error,
+        },
+    )
+
+
+@app.get("/api/launch-ready")
+async def launch_ready():
+    """Paid-production launch gate, independent of the current environment."""
+    config_errors = settings.launch_readiness_errors()
+    checks = {
+        "generation_worker": queue.generation_ready,
+        "production_environment": settings.app_environment == "production",
+        "payment_configured": PaymentService.is_paddle_configured(),
+        "launch_config": not config_errors,
+    }
+    is_ready = all(checks.values())
+    return JSONResponse(
+        status_code=200 if is_ready else 503,
+        content={
+            "status": "launch_ready" if is_ready else "not_launch_ready",
+            "checks": checks,
+            "configuration_errors": config_errors,
+            "provider_error": queue.worker_readiness_error,
+        },
+    )
 
 
 @app.get("/api/config/public")
@@ -104,4 +166,8 @@ async def public_config():
     """Public, unauthenticated site config — things the marketing/footer UI needs
     before any session exists (ICP 备案号 for the footer, etc.). No secrets here.
     """
-    return {"icp_beian": settings.icp_beian}
+    return {
+        "icp_beian": settings.icp_beian,
+        "paddle_client_token": settings.paddle_client_token,
+        "paddle_environment": settings.paddle_environment,
+    }

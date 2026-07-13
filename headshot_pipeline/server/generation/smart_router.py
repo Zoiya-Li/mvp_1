@@ -64,7 +64,7 @@ class SmartModelRouter:
             user_tier="standard",
         )
         # decision.provider = "openrouter"
-        # decision.model = "google/gemini-3.1-flash-image-preview"
+        # decision.model = "google/gemini-3.1-flash-image"
         # decision.reason = "hero_face requires high identity fidelity"
     """
 
@@ -152,6 +152,9 @@ class SmartModelRouter:
         if backend == "openrouter":
             from ..image_gateway import OPENROUTER_GEMINI_CAPABILITIES
             self._providers.append(OPENROUTER_GEMINI_CAPABILITIES)
+        elif backend == "siliconflow":
+            from ..image_gateway import SILICONFLOW_QWEN_CAPABILITIES
+            self._providers.append(SILICONFLOW_QWEN_CAPABILITIES)
         elif backend == "chrome":
             from ..image_gateway import CHROME_GEMINI_CAPABILITIES
             self._providers.append(CHROME_GEMINI_CAPABILITIES)
@@ -183,13 +186,21 @@ class SmartModelRouter:
         profile = self.TASK_PROFILES.get(task_type)
         if profile is None:
             profile = self._infer_profile_from_shot_spec(shot_spec)
+        effective_task = profile.task_type
 
-        # Score each provider
+        # Capability is a hard constraint, not a soft score. An upscaler may be
+        # cheap and high fidelity, but it cannot generate a portrait.
+        capable_providers = [
+            provider for provider in self._providers
+            if effective_task in provider.supported_tasks
+        ]
+
+        # Score each capable provider
         best_score = -1.0
         best_provider = None
         best_reason = ""
 
-        for provider in self._providers:
+        for provider in capable_providers:
             score, reason = self._score_provider(provider, profile, user_tier, budget_remaining)
             if score > best_score:
                 best_score = score
@@ -197,9 +208,16 @@ class SmartModelRouter:
                 best_reason = reason
 
         if best_provider is None:
-            # Fallback to default
+            # Fallback remains operation-aware so a missing registry entry can
+            # never route generation to a local post-processing model.
             from ..image_gateway import provider_for_operation
-            cap = provider_for_operation("CREATE_FROM_REFERENCES")
+            operation = {
+                "local_edit": "LOCAL_EDIT",
+                "identity_repair": "IDENTITY_REPAIR",
+                "upscale": "UPSCALE",
+                "final_render": "FINAL_RENDER",
+            }.get(effective_task, "CREATE_FROM_REFERENCES")
+            cap = provider_for_operation(operation)
             return RoutingDecision(
                 provider=cap.provider,
                 model=cap.model,

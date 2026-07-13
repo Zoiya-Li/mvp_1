@@ -118,26 +118,36 @@ class PolicyEngine:
         # 2. Compute context modifiers
         budget_modifier = self._budget_modifier(budget)
         risk_profile = self._shot_risk_profile(shot_spec)
-        feedback_modifier = self._feedback_modifier(session_feedback, base_action)
-
         # 3. Score all possible actions
         policy_scores = self._score_all_actions(
             judgement=judgement,
             base_action=base_action,
             budget_modifier=budget_modifier,
             risk_profile=risk_profile,
-            feedback_modifier=feedback_modifier,
+            session_feedback=session_feedback,
             edit_count=edit_count,
             identity_repairs=identity_repairs,
             identity_thresholds=identity_thresholds,
         )
 
-        # 4. Select highest-scoring action
-        best_action = max(policy_scores, key=lambda a: policy_scores[a]["score"])
+        # 4. Select highest-scoring feasible action. Policy scoring may rank
+        # valid actions, but it must never turn a failed hard gate into ACCEPT.
+        feasible_actions = [
+            action for action, item in policy_scores.items()
+            if item.get("eligible")
+        ]
+        best_action = max(
+            feasible_actions,
+            key=lambda action: policy_scores[action]["score"],
+        ) if feasible_actions else base_action
         best_score = policy_scores[best_action]["score"]
+        feedback_modifier = self._feedback_modifier(session_feedback, best_action)
 
         # 5. Build enriched decision
-        confidence = self._compute_confidence(best_score, policy_scores)
+        confidence = self._compute_confidence(
+            best_score,
+            {action: policy_scores[action] for action in feasible_actions},
+        )
         reason = self._build_reason(
             base_action=base_action,
             final_action=best_action,
@@ -150,6 +160,7 @@ class PolicyEngine:
             "action": best_action,
             "reason": reason,
             "policy_scores": {a: round(s["score"], 3) for a, s in policy_scores.items()},
+            "eligible_actions": feasible_actions,
             "confidence": round(confidence, 3),
             "base_action": base_action,
             "budget_modifier": round(budget_modifier, 3),
@@ -213,7 +224,7 @@ class PolicyEngine:
         base_action: str,
         budget_modifier: float,
         risk_profile: dict,
-        feedback_modifier: float,
+        session_feedback: list[dict] | None,
         edit_count: int,
         identity_repairs: int,
         identity_thresholds: dict | None = None,
@@ -229,9 +240,25 @@ class PolicyEngine:
         style_match = scores_data.get("style_match")
         artifact = scores_data.get("artifact")
         failures = set(judgement.get("hard_failures") or [])
+        thresholds = self._router._resolve_thresholds(identity_thresholds)
+        identity_pass_threshold = float(
+            thresholds.get("identity_pass_threshold", IDENTITY_PASS_THRESHOLD)
+        )
+        identity_repair_threshold = float(
+            thresholds.get("identity_repair_threshold", IDENTITY_REPAIR_THRESHOLD)
+        )
+        from .evaluator import EvaluationService
+        gate = EvaluationService._candidate_gate_status(judgement, thresholds)
 
         # Hard constraints already handled in decide() via _hard_constraint_override
         for action in AgentRouter.ALLOWED_ACTIONS:
+            eligible = self._action_is_eligible(
+                action=action,
+                base_action=base_action,
+                gate=gate,
+                edit_count=edit_count,
+                identity_repairs=identity_repairs,
+            )
             base = self.ACTION_BASE_SCORES.get(action, 0.0)
             score = base
 
@@ -268,7 +295,7 @@ class PolicyEngine:
                     identity_boost = (identity / 10.0) * identity_weight
                     score *= (0.5 + identity_boost)
                     # Strong penalty if identity is below pass threshold
-                    if identity < IDENTITY_PASS_THRESHOLD:
+                    if identity < identity_pass_threshold:
                         score *= 0.1  # Gray zone identity → don't accept, repair instead
                 else:
                     score *= 0.3  # Unverified identity → very risky to accept
@@ -278,23 +305,64 @@ class PolicyEngine:
 
             if action == "IDENTITY_REPAIR":
                 # Boost identity repair when identity is in gray zone
-                if identity is not None and IDENTITY_REPAIR_THRESHOLD <= identity < IDENTITY_PASS_THRESHOLD:
+                if (
+                    identity is not None
+                    and identity_repair_threshold <= identity < identity_pass_threshold
+                ):
                     score *= 3.0
 
             if action == "REGENERATE_FROM_ORIGINAL":
                 # High-risk shots benefit more from regeneration
                 score *= (1.0 + risk * 0.5)
 
-            # Feedback conditioning
-            score *= (1.0 + feedback_modifier)
+            # Feedback conditioning is action-specific: dislikes reduce ACCEPT
+            # while increasing identity repair/regeneration preference.
+            action_feedback_modifier = self._feedback_modifier(
+                session_feedback,
+                action,
+            )
+            score *= (1.0 + action_feedback_modifier)
 
             # Base action bias: slight preference for the rule-based recommendation
             if action == base_action:
                 score *= 1.1
 
-            scores[action] = {"score": max(0.0, min(1.0, score))}
+            scores[action] = {
+                "score": max(0.0, min(1.0, score)),
+                "eligible": eligible,
+            }
 
         return scores
+
+    @staticmethod
+    def _action_is_eligible(
+        *,
+        action: str,
+        base_action: str,
+        gate: dict,
+        edit_count: int,
+        identity_repairs: int,
+    ) -> bool:
+        """Keep policy ranking inside the bounded state-machine action set."""
+        if action == "ACCEPT":
+            return bool(gate.get("hard_gates_pass"))
+        if action == "LOCAL_EDIT":
+            return base_action == "LOCAL_EDIT" and edit_count < 2
+        if action == "IDENTITY_REPAIR":
+            return base_action == "IDENTITY_REPAIR" and identity_repairs < 1
+        if action == "REGENERATE_FROM_ORIGINAL":
+            return base_action in {
+                "REGENERATE_FROM_ORIGINAL",
+                "DROP_CANDIDATE",
+            }
+        if action == "REGENERATE_WITH_POSE_REFERENCE":
+            # The current candidate executor has no pose-reference branch.
+            return False
+        if action == "REQUEST_BETTER_REFERENCE":
+            return base_action == "REQUEST_BETTER_REFERENCE"
+        if action == "DROP_CANDIDATE":
+            return True
+        return False
 
     def _budget_modifier(self, budget: dict) -> float:
         """Return 0.0-1.0 modifier based on budget remaining.

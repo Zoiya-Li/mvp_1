@@ -1,0 +1,9 @@
+# Test/dev dependencies — install in addition to requirements.txt.
+# Used by the deploy-time pytest gate (deploy/overseas-vps/DEPLOY_OVERSEAS_VPS.md §4).
+#
+# pytest-asyncio is REQUIRED for the gate to be valid: without it, every
+# @pytest.mark.asyncio test emits PytestUnknownMarkWarning and is silently
+# skipped, so the suite reports green without actually exercising any async
+# path (job queue, generation, revision, delivery).
+pytest>=8.3.4
+pytest-asyncio==1.2.0

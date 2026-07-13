@@ -36,6 +36,7 @@ if str(_PIPELINE) not in sys.path:
     sys.path.insert(0, str(_PIPELINE))
 
 import server.gemini_worker as gemini_worker_module  # noqa: E402
+from server.config import settings  # noqa: E402
 from server.evaluation import EvaluationService, AgentRouter, PolicyEngine  # noqa: E402
 from server.gemini_worker import (  # noqa: E402
     GeminiWorker,
@@ -62,6 +63,12 @@ from server.models import (  # noqa: E402
 )
 
 
+@pytest.fixture(autouse=True)
+def _stable_gateway_cost_baseline(monkeypatch):
+    """Keep legacy loop-budget assertions independent of a developer's .env."""
+    monkeypatch.setattr(settings, "gemini_backend", "openrouter")
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Layer 1: the parser (pure)
 # ──────────────────────────────────────────────────────────────────────
@@ -81,7 +88,7 @@ PARSE_CASES = [
     ("empty text -> (None,None)", "", None, False),
     ("score>=8 with no trigger -> feedback None", "评分：9/10\n非常相似，无需调整。", 9, False),
     # ── DECIMAL SCORES (regression guard for the 9.5→5 mis-score bug) ──
-    # gemini-3.1-flash-image-preview returns decimals despite the integer prompt.
+    # gemini-3.1-flash-image returns decimals despite the integer prompt.
     # The old integer-only `(\d+)` patterns broke on these: pattern 1 failed
     # (the ".5" sat between the digit and "/10"), then the fallback greedily
     # matched the "5" in "9.5" → score=5 → needless revision of an excellent
@@ -460,6 +467,51 @@ def test_local_identity_similarity_uses_six_identity_pack_references(monkeypatch
     assert result["measurements"]["reference_faces_detected"] == 6
     assert seen_images[:6] == [f"/tmp/ref_{idx}.png" for idx in range(1, 7)]
     assert seen_images[6] == "/tmp/generated.png"
+
+
+def test_calibrated_cosine_threshold_is_a_real_hard_failure(monkeypatch):
+    cv2 = pytest.importorskip("cv2")
+    np = pytest.importorskip("numpy")
+
+    class FakeLearningLayer:
+        def get_calibration(self):
+            return SimpleNamespace(
+                sample_count=20,
+                identity_pass_threshold=8.0,
+                identity_repair_threshold=7.0,
+                identity_cosine_accept=0.47,
+            )
+
+    class FakeIdentityApp:
+        def get(self, img):
+            if "generated" in img:
+                embedding = np.array([0.46, np.sqrt(1.0 - 0.46**2), 0.0])
+            else:
+                embedding = np.array([1.0, 0.0, 0.0])
+            return [SimpleNamespace(bbox=[0, 0, 10, 10], normed_embedding=embedding)]
+
+    monkeypatch.setattr(cv2, "imread", lambda path: str(path))
+    eval_svc = EvaluationService(learning_layer=FakeLearningLayer())
+    eval_svc._get_identity_app = lambda: FakeIdentityApp()  # type: ignore[assignment]
+
+    result = eval_svc._local_identity_similarity_check(
+        "/tmp/generated.png",
+        ["/tmp/reference.png"],
+    )
+
+    assert result["score"] == 8
+    assert result["measurements"]["identity_accept_cosine"] == 0.47
+    assert "identity_too_low" in result["hard_failures"]
+    gate = EvaluationService._candidate_gate_status({
+        "scores": {
+            "identity": result["score"],
+            "face_quality": 9,
+            "artifact": 9,
+            "commercial_readiness": 9,
+        },
+        "hard_failures": result["hard_failures"],
+    })
+    assert gate["identity_pass"] is False
 
 
 def test_merge_identity_quality_caps_vlm_identity_and_requests_repair():
@@ -1020,6 +1072,11 @@ def test_quality_pipeline_skips_face_swap_for_high_identity_candidate():
     ] == ["front_neutral"]
     assert meta["provider_invocations"][0]["operation"] == "CREATE_FROM_REFERENCES"
     assert meta["provider_invocations"][0]["provider"] == "openrouter"
+    assert meta["strategy"]["generation_task_type"] == "half_body"
+    assert meta["strategy"]["generation_routing"]["provider"] == "openrouter"
+    assert meta["provider_invocations"][0]["routing_decision"] == (
+        meta["strategy"]["generation_routing"]
+    )
     assert meta["provider_invocations"][0]["reference_ids"] == ["ref_1"]
     assert meta["provider_invocations"][0]["cost"] == 0.12
     assert meta["provider_invocations"][0]["estimated_cost"] == 0.12

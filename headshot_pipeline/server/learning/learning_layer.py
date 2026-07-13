@@ -46,6 +46,7 @@ class ThresholdCalibration:
     quality_accept_threshold: float = 8.0
     # How many feedback samples contributed to this calibration
     sample_count: int = 0
+    feedback_version: int = 0
     # When the calibration was last updated
     updated_at: str | None = None
 
@@ -100,6 +101,7 @@ class LearningLayer:
                     identity_cosine       REAL NOT NULL DEFAULT 0.45,
                     quality_accept        REAL NOT NULL DEFAULT 8.0,
                     sample_count          INTEGER NOT NULL DEFAULT 0,
+                    feedback_version      INTEGER NOT NULL DEFAULT 0,
                     updated_at            TEXT NOT NULL
                 );
 
@@ -114,6 +116,19 @@ class LearningLayer:
                 );
                 """
             )
+            columns = {
+                row[1]
+                for row in conn.execute(
+                    "PRAGMA table_info(threshold_calibration)"
+                ).fetchall()
+            }
+            if "feedback_version" not in columns:
+                conn.execute(
+                    """
+                    ALTER TABLE threshold_calibration
+                    ADD COLUMN feedback_version INTEGER NOT NULL DEFAULT 0
+                    """
+                )
             # Seed the single calibration row if absent
             conn.execute(
                 """
@@ -147,6 +162,18 @@ class LearningLayer:
     ) -> None:
         """Store a user feedback label."""
         with self._conn() as conn:
+            if event in {"looks_like_me", "not_like_me"}:
+                # Identity feedback is a mutable label, not an append-only vote.
+                # Keep the latest answer per image so repeated UI submissions
+                # cannot overweight one portrait in global calibration.
+                conn.execute(
+                    """
+                    DELETE FROM feedback_labels
+                    WHERE image_id = ?
+                      AND event IN ('looks_like_me', 'not_like_me')
+                    """,
+                    (image_id,),
+                )
             conn.execute(
                 """
                 INSERT INTO feedback_labels
@@ -233,6 +260,7 @@ class LearningLayer:
             identity_cosine_accept=row["identity_cosine"],
             quality_accept_threshold=row["quality_accept"],
             sample_count=row["sample_count"],
+            feedback_version=row["feedback_version"],
             updated_at=row["updated_at"],
         )
         return self._calibration
@@ -278,8 +306,14 @@ class LearningLayer:
         stats = self.feedback_stats()
         cal = self.get_calibration()
         total = stats["total"]
-        if total < 10:
-            # Not enough data — return current without changes
+        with self._conn() as conn:
+            version_row = conn.execute(
+                "SELECT COALESCE(MAX(label_id), 0) AS version FROM feedback_labels"
+            ).fetchone()
+        feedback_version = int(version_row["version"] or 0)
+        if total < 10 or feedback_version <= cal.feedback_version:
+            # Require a minimum sample and never re-apply a calibration to the
+            # same dataset after a restart or repeated scheduler call.
             return cal
 
         not_like_me_rate = stats.get("not_like_me_rate") or 0.0
@@ -330,11 +364,16 @@ class LearningLayer:
 
             # Update sample count
             conn.execute(
-                "UPDATE threshold_calibration SET sample_count = ? WHERE id = 1",
-                (total,),
+                """
+                UPDATE threshold_calibration
+                SET sample_count = ?, feedback_version = ?, updated_at = ?
+                WHERE id = 1
+                """,
+                (total, feedback_version, datetime.now(timezone.utc).isoformat()),
             )
 
         cal.sample_count = total
+        cal.feedback_version = feedback_version
         cal.updated_at = datetime.now(timezone.utc).isoformat()
         self._calibration = cal
         return cal

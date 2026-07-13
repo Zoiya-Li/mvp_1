@@ -184,6 +184,25 @@ class TestPolicyEngineDecide:
         )
         assert decision["feedback_modifier"] > 0
 
+    def test_feedback_changes_actions_in_opposite_directions(
+        self, policy, sample_judgement, healthy_budget
+    ):
+        baseline = policy.decide(
+            judgement=sample_judgement,
+            budget=healthy_budget,
+        )
+        disliked = policy.decide(
+            judgement=sample_judgement,
+            budget=healthy_budget,
+            session_feedback=[{"event": "not_like_me", "image_id": "img1"}],
+        )
+
+        assert disliked["policy_scores"]["ACCEPT"] < baseline["policy_scores"]["ACCEPT"]
+        assert (
+            disliked["policy_scores"]["REGENERATE_FROM_ORIGINAL"]
+            > baseline["policy_scores"]["REGENERATE_FROM_ORIGINAL"]
+        )
+
     def test_policy_scores_present(self, policy, sample_judgement, healthy_budget):
         decision = policy.decide(
             judgement=sample_judgement,
@@ -360,3 +379,34 @@ class TestPolicyEngineEdgeCases:
         # Even high-risk shot with excellent identity should be accepted
         assert decision["action"] == "ACCEPT"
         assert "high_risk_shot" in decision["reason"]
+
+    def test_policy_cannot_accept_candidate_that_failed_quality_gate(
+        self, policy, healthy_budget
+    ):
+        judgement = {
+            "scores": {
+                "identity": 9.0,
+                "face_quality": 7.0,
+                "artifact": 9.0,
+                "commercial_readiness": 9.0,
+                "style_match": 9.0,
+            },
+            "hard_failures": [],
+            "recommended_action": "accept",
+        }
+
+        decision = policy.decide(judgement=judgement, budget=healthy_budget)
+
+        assert decision["base_action"] == "DROP_CANDIDATE"
+        assert decision["action"] != "ACCEPT"
+        assert "ACCEPT" not in decision["eligible_actions"]
+
+    def test_unimplemented_pose_reference_action_is_never_eligible(
+        self, policy, sample_judgement, healthy_budget
+    ):
+        decision = policy.decide(
+            judgement=sample_judgement,
+            budget=healthy_budget,
+        )
+
+        assert "REGENERATE_WITH_POSE_REFERENCE" not in decision["eligible_actions"]

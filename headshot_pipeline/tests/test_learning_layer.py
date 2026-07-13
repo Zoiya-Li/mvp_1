@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import sqlite3
+
 import pytest
 from pathlib import Path
 
 from server.learning import LearningLayer, ThresholdCalibration, FeedbackLabel
+from server.evaluation import EvaluationService
 
 
 def _make_layer(tmp_path: Path) -> LearningLayer:
@@ -28,6 +31,16 @@ class TestFeedbackIngestion:
         labels = ll.feedback_for_image("img_1")
         assert len(labels) == 2
 
+    def test_latest_identity_label_replaces_previous_vote(self, tmp_path):
+        ll = _make_layer(tmp_path)
+        ll.record_feedback("img_1", "sess_1", "looks_like_me", score=2)
+        ll.record_feedback("img_1", "sess_1", "not_like_me", score=0)
+
+        labels = ll.feedback_for_image("img_1")
+
+        assert len(labels) == 1
+        assert labels[0].event == "not_like_me"
+
     def test_feedback_stats(self, tmp_path):
         ll = _make_layer(tmp_path)
         ll.record_feedback("img_1", "sess_1", "looks_like_me", score=2)
@@ -47,6 +60,35 @@ class TestFeedbackIngestion:
         assert stats["total"] == 0
         assert stats["identity_accuracy"] is None
 
+    def test_existing_calibration_schema_is_migrated_in_place(self, tmp_path):
+        db_path = tmp_path / "legacy_learning.db"
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                """
+                CREATE TABLE threshold_calibration (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    identity_pass REAL NOT NULL DEFAULT 8.0,
+                    identity_repair REAL NOT NULL DEFAULT 7.0,
+                    identity_cosine REAL NOT NULL DEFAULT 0.45,
+                    quality_accept REAL NOT NULL DEFAULT 8.0,
+                    sample_count INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+
+        ll = LearningLayer(db_path=db_path)
+
+        assert ll.get_calibration().feedback_version == 0
+        with sqlite3.connect(db_path) as conn:
+            columns = {
+                row[1]
+                for row in conn.execute(
+                    "PRAGMA table_info(threshold_calibration)"
+                )
+            }
+        assert "feedback_version" in columns
+
 
 class TestCalibration:
     def test_default_calibration(self, tmp_path):
@@ -56,6 +98,7 @@ class TestCalibration:
         assert cal.identity_repair_threshold == 7.0
         assert cal.identity_cosine_accept == 0.45
         assert cal.sample_count == 0
+        assert cal.feedback_version == 0
 
     def test_calibrate_not_enough_data(self, tmp_path):
         ll = _make_layer(tmp_path)
@@ -137,7 +180,7 @@ class TestCalibration:
         # Push threshold to the limit with extreme feedback
         for _ in range(5):
             for i in range(20):
-                ll.record_feedback(f"img_{i}", "sess_1", "not_like_me")
+                ll.record_feedback(f"img_{_}_{i}", "sess_1", "not_like_me")
             ll.calibrate()
         cal = ll.get_calibration()
         # Should be bounded at MAX_IDENTITY_PASS (high not_like_me → increase threshold)
@@ -153,3 +196,43 @@ class TestCalibration:
         ll.record_feedback("img_1", "sess_1", "looks_like_me")
         cal3 = ll.get_calibration()
         assert cal3 is not cal1
+
+    def test_calibration_is_idempotent_without_new_samples(self, tmp_path):
+        ll = _make_layer(tmp_path)
+        for i in range(20):
+            ll.record_feedback(f"img_{i}", "sess_1", "not_like_me")
+
+        first = ll.calibrate().identity_pass_threshold
+        second = ll.calibrate().identity_pass_threshold
+
+        assert second == first
+
+    def test_changed_identity_label_recalibrates_without_count_growth(self, tmp_path):
+        ll = _make_layer(tmp_path)
+        for i in range(20):
+            ll.record_feedback(f"img_{i}", "sess_1", "not_like_me")
+        first = ll.calibrate()
+        first_version = first.feedback_version
+        first_history_size = len(ll.adjustment_history())
+
+        ll.record_feedback("img_0", "sess_1", "looks_like_me")
+        second = ll.calibrate()
+
+        assert second.sample_count == 20
+        assert second.feedback_version > first_version
+        assert len(ll.adjustment_history()) > first_history_size
+
+    def test_calibrated_delta_preserves_shot_geometry_profile(self, tmp_path):
+        ll = _make_layer(tmp_path)
+        for i in range(20):
+            ll.record_feedback(f"img_{i}", "sess_1", "not_like_me")
+        ll.calibrate()
+
+        thresholds = EvaluationService(ll)._get_identity_thresholds(
+            {"shot_id": "full_body"}
+        )
+
+        assert thresholds["calibrated"] is True
+        assert thresholds["calibration_sample_count"] == 20
+        assert thresholds["identity_pass_threshold"] == pytest.approx(7.05)
+        assert thresholds["identity_repair_threshold"] == pytest.approx(5.95)

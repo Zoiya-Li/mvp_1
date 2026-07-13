@@ -18,9 +18,11 @@ from server.image_gateway import (  # noqa: E402
     invocation_provider_metadata,
     provider_for_operation,
 )
+from server.config import settings  # noqa: E402
 
 
-def test_gateway_estimates_reference_heavy_generation_cost():
+def test_gateway_estimates_reference_heavy_generation_cost(monkeypatch):
+    monkeypatch.setattr(settings, "gemini_backend", "openrouter")
     assert estimate_cost("CREATE_FROM_REFERENCES", reference_count=1) == 0.12
     assert estimate_cost("CREATE_FROM_REFERENCES", reference_count=4) == 0.1488
     assert estimate_cost("IDENTITY_REPAIR", reference_count=4) == 0.0
@@ -28,7 +30,8 @@ def test_gateway_estimates_reference_heavy_generation_cost():
     assert estimate_cost("FINAL_RENDER", reference_count=0) == 0.0
 
 
-def test_gateway_exposes_provider_capabilities():
+def test_gateway_exposes_provider_capabilities(monkeypatch):
+    monkeypatch.setattr(settings, "gemini_backend", "openrouter")
     cap = provider_for_operation("CREATE_FROM_REFERENCES")
     assert cap.provider == "openrouter"
     assert cap.supports_multiple_references is True
@@ -49,7 +52,8 @@ def test_gateway_exposes_provider_capabilities():
     assert upscale["provider_capabilities"]["supports_high_fidelity"] is True
 
 
-def test_gateway_builds_spec_aligned_provider_invocation_record():
+def test_gateway_builds_spec_aligned_provider_invocation_record(monkeypatch):
+    monkeypatch.setattr(settings, "gemini_backend", "openrouter")
     record = build_provider_invocation_metadata(
         invocation_id="create_1",
         operation="CREATE_FROM_REFERENCES",
@@ -74,3 +78,14 @@ def test_gateway_builds_spec_aligned_provider_invocation_record():
     assert record["estimated_cost"] == 0.14
     assert record["result_status"] == "success"
     assert record["provider_capabilities"]["supports_multiple_references"] is True
+
+
+def test_gateway_exposes_siliconflow_limits(monkeypatch):
+    monkeypatch.setattr(settings, "gemini_backend", "siliconflow")
+
+    cap = provider_for_operation("CREATE_FROM_REFERENCES")
+
+    assert cap.provider == "siliconflow"
+    assert cap.model == settings.siliconflow_image_model
+    assert cap.max_reference_images == 3
+    assert cap.supports_seed is True

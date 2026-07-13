@@ -59,7 +59,7 @@ export function PaymentModal({
       const poll = async () => {
         if (!mountedRef.current) return;
         try {
-          const status = await getPaymentStatus(pid);
+          const status = await getPaymentStatus(sessionId, pid);
           if (!mountedRef.current) return;
           if (status.status === "paid") {
             setPolling(false);
@@ -80,7 +80,7 @@ export function PaymentModal({
       };
       poll();
     },
-    [onPaymentSuccess]
+    [onPaymentSuccess, sessionId]
   );
 
   // Cleanup polling on unmount — cancel the actual timer

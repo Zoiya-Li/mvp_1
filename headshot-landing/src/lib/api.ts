@@ -150,7 +150,11 @@ export async function getPricingTiers(): Promise<PricingResponse> {
 /** Public site config (ICP filing number for CN deployments, etc.). For the
  *  overseas build icp_beian is empty and the footer auto-hides the block.
  *  No auth; safe to call pre-session. */
-export async function getPublicConfig(): Promise<{ icp_beian: string }> {
+export async function getPublicConfig(): Promise<{
+  icp_beian: string;
+  paddle_client_token: string;
+  paddle_environment: string;
+}> {
   return asJson(apiFetch("/config/public"), "GET /config/public");
 }
 
@@ -413,10 +417,14 @@ export async function createPayment(
 }
 
 export async function getPaymentStatus(
+  sessionId: string,
   paymentId: string
 ): Promise<PaymentStatusResponse> {
   return asJson(
-    apiFetch(`/sessions/payment/${paymentId}/status`, { method: "GET" }),
+    apiFetch(`/sessions/${sessionId}/payment/${paymentId}/status`, {
+      method: "GET",
+      sessionId,
+    }),
     "GET /payment/status"
   );
 }

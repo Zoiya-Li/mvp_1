@@ -75,6 +75,15 @@ def test_signature_accepts_valid():
     assert verify_paddle_signature(BODY, header, SECRET) is True
 
 
+def test_signature_accepts_any_valid_h1_during_secret_rotation():
+    header = _sign(BODY, SECRET)
+    ts, valid = header.split(";", 1)
+
+    assert verify_paddle_signature(
+        BODY, f"{ts};h1={'0' * 64};{valid}", SECRET
+    ) is True
+
+
 def test_signature_rejects_wrong_secret():
     header = _sign(BODY, SECRET)
     assert verify_paddle_signature(BODY, header, "whsec_DIFFERENT_key") is False
@@ -136,6 +145,24 @@ def test_signature_rejects_empty_inputs():
 def test_extract_primary_path():
     data = {"data": {"checkout": {"url": "https://checkout.paddle.com/txn_123"}}}
     assert _extract_checkout_url(data) == "https://checkout.paddle.com/txn_123"
+
+
+def test_extract_approved_paddle_js_payment_link(monkeypatch):
+    monkeypatch.setattr(
+        settings, "paddle_return_url", "https://flashshot.top/checkout"
+    )
+    url = "https://flashshot.top/checkout?_ptxn=txn_01h2b0qpjc0xt8k5aw6nsdec4p"
+
+    assert _extract_checkout_url({"data": {"checkout": {"url": url}}}) == url
+
+
+def test_extract_rejects_unapproved_lookalike_payment_link(monkeypatch):
+    monkeypatch.setattr(
+        settings, "paddle_return_url", "https://flashshot.top/checkout"
+    )
+    url = "https://flashshot.top.evil.example/checkout?_ptxn=txn_fake"
+
+    assert _extract_checkout_url({"data": {"checkout": {"url": url}}}) is None
 
 
 def test_extract_fallback_scan():

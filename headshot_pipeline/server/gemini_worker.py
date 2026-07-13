@@ -75,7 +75,7 @@ PIPELINE_ALLOWED_ACTIONS = [
     "REQUEST_BETTER_REFERENCE",
 ]
 
-# Nano Banana 2 (google/gemini-3.1-flash-image-preview) supports up to 4
+# Nano Banana 2 (google/gemini-3.1-flash-image) supports up to 4
 # character references via the API. Sending more confuses identity anchoring
 # and wastes input tokens; cap reference photos to the first 4 uploads.
 MAX_CHARACTER_REFERENCES = 4
@@ -370,6 +370,27 @@ def identity_threshold_profile(shot_spec: dict | None = None) -> dict:
     return profile
 
 
+def model_task_type_for_shot(
+    shot_spec: dict | None = None,
+    *,
+    force_closeup: bool = False,
+) -> str:
+    """Map a planned shot to the SmartModelRouter task vocabulary."""
+    if force_closeup:
+        return "hero_face"
+    shot_spec = shot_spec or {}
+    shot_id = str(shot_spec.get("shot_id") or "").lower()
+    framing = str(shot_spec.get("framing") or "").lower()
+    text = f"{shot_id} {framing}"
+    if "closeup" in text or "close-up" in text or "head and shoulders" in text:
+        return "hero_face"
+    if "environmental" in text or "wide" in text:
+        return "environmental"
+    if "full_body" in text or "full body" in text:
+        return "full_body"
+    return "half_body"
+
+
 def build_shot_spec_metadata(prompt: str, title: str, template_path: str | None) -> dict:
     """Represent the current job as a single planned shot.
 
@@ -452,10 +473,10 @@ class _PipelineProfile:
 class GeminiWorker:
     """Wraps the image-generation gateway with session-aware pipeline management."""
 
-    def __init__(self):
+    def __init__(self, learning_layer: LearningLayer | None = None):
         self.active_session_id: str | None = None
         self._turn_counts: dict[str, int] = {}
-        self._learning_layer = LearningLayer()
+        self._learning_layer = learning_layer or LearningLayer()
         self._eval_service = EvaluationService(learning_layer=self._learning_layer)
         self._agent_router = PolicyEngine(
             agent_router=AgentRouter(identity_threshold_profile),
@@ -463,10 +484,12 @@ class GeminiWorker:
         )
         self._face_swap_repair = FaceSwapRepair()
         self._gateway = ImageGateway()
+        self.provider_readiness: dict | None = None
 
     def connect(self):
         """Validate the provider is ready. Called during startup."""
         self._gateway.end_session()
+        self.provider_readiness = self._gateway.check_readiness()
 
     def disconnect(self):
         """Clean up provider state."""
@@ -617,7 +640,16 @@ class GeminiWorker:
         )
         if profile.force_closeup:
             shot_spec["shot_id"] = "closeup"
-        identity_thresholds = identity_threshold_profile(shot_spec)
+        identity_thresholds = self._eval_service._get_identity_thresholds(shot_spec)
+        generation_task_type = model_task_type_for_shot(
+            shot_spec,
+            force_closeup=profile.force_closeup,
+        )
+        generation_routing = self._gateway.route_by_task(
+            generation_task_type,
+            shot_spec=shot_spec,
+            budget_remaining=profile.max_total_api_cost,
+        )
         cand_word = profile.progress_candidate_word
 
         metadata = {
@@ -653,6 +685,8 @@ class GeminiWorker:
                 "identity_threshold_profile": identity_thresholds,
                 "reference_count": len(ref_photos),
                 "prompt_version": profile.prompt_version,
+                "generation_task_type": generation_task_type,
+                "generation_routing": generation_routing,
             },
             "candidates": candidates,
             "agent_actions": agent_actions,
@@ -718,6 +752,7 @@ class GeminiWorker:
                 cost=invocation_cost,
                 result_status="success",
             )
+            invocation["routing_decision"] = generation_routing
             provider_invocations.append(invocation)
             metadata["budget"]["estimated_cost_used"] = round(
                 metadata["budget"]["estimated_cost_used"] + invocation_cost, 4
@@ -844,6 +879,7 @@ class GeminiWorker:
                 cost=regen_cost,
                 result_status="success",
             )
+            invocation["routing_decision"] = generation_routing
             provider_invocations.append(invocation)
             metadata["budget"]["estimated_cost_used"] = round(
                 metadata["budget"]["estimated_cost_used"] + regen_cost, 4
@@ -956,6 +992,14 @@ class GeminiWorker:
                             action_record["skip_reason"] = "max_total_api_cost_reached"
 
         if local_edit_needed:
+            local_edit_routing = self._gateway.route_by_task(
+                "local_edit",
+                shot_spec=shot_spec,
+                budget_remaining=(
+                    metadata["budget"]["max_total_api_cost"]
+                    - metadata["budget"]["estimated_cost_used"]
+                ),
+            )
             started_at = time.time()
             edit_prompt = build_local_edit_prompt(selected.get("judgement", {}))
             edited_path = self._gateway.local_edit(
@@ -979,6 +1023,7 @@ class GeminiWorker:
                 cost=local_edit_cost,
                 result_status="success",
             )
+            local_invocation["routing_decision"] = local_edit_routing
             provider_invocations.append(local_invocation)
             metadata["budget"]["estimated_cost_used"] = round(
                 metadata["budget"]["estimated_cost_used"] + local_edit_cost, 4
@@ -1481,7 +1526,7 @@ class GeminiWorker:
         # Extract score: try patterns in priority order.
         #
         # DECIMAL SCORES (root-cause fix, verified against the live API):
-        # gemini-3.1-flash-image-preview frequently returns DECIMAL scores
+        # gemini-3.1-flash-image frequently returns DECIMAL scores
         # ("评分：9.5/10", "评分：9.2/10") despite the prompt asking for an
         # integer. The old integer-only `(\d+)` groups broke on these:
         #   - pattern `评分[：:]\s*(\d+)\s*/\s*10` failed on "9.5/10" (the ".5"
@@ -1558,12 +1603,7 @@ class GeminiWorker:
         is a LOCAL_EDIT — it retouches the existing image rather than
         regenerating from scratch, so identity is preserved.
         """
-        if self.active_session_id != session_id:
-            raise RuntimeError(
-                f"Session {session_id} is not the active conversation "
-                f"(active: {self.active_session_id}). "
-                "Cannot revise without an active generation."
-            )
+        self._ensure_session(session_id)
 
         turn = self._turn_counts.get(session_id, 1) + 1
         self._turn_counts[session_id] = turn
@@ -1592,6 +1632,10 @@ class GeminiWorker:
             image_path,
             reference_photo_paths or [],
         )
+
+    def identity_thresholds_for_shot(self, shot_spec: dict | None = None) -> dict:
+        """Return the current geometry-aware, feedback-calibrated thresholds."""
+        return self._eval_service._get_identity_thresholds(shot_spec)
 
     def end_session(self, session_id: str):
         """End the conversation for a session."""

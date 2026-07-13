@@ -1,7 +1,7 @@
 # FlashShot — Next.js web app (marketing site + upload/review UI).
 #
-# `next start` bound to LOOPBACK:3001 behind Caddy (:443 → :3001 for everything
-# EXCEPT /api/* and /ws/*, which Caddy routes to flashshot-api). The app MUST be
+# `next start` bound to LOOPBACK:3001 behind Caddy for everything except
+# /api/* and /ws/*, which Caddy routes to flashshot-api. The app MUST be
 # built first (`npm run build` in /opt/flashshot/web) — see DEPLOY_OVERSEAS_VPS.md.
 #
 # Install:  sudo install -m644 flashshot-web.service /etc/systemd/system/
@@ -26,7 +26,7 @@ Environment=PORT=3001
 # Node binary + the project-local next CLI (no global next install needed).
 #
 # Node is installed nvm-ISOLATED under /opt/flashshot/.nvm (Node 20 LTS), NEVER
-# to /usr/bin/node — this box is shared (Syntropy/Caddy/Tailscale/fwxt-relay)
+# to /usr/bin/node - this box is shared (Syntropy/Caddy/Tailscale/fwxt-relay)
 # and a global NodeSource install was forbidden as a co-tenant risk. The deploy
 # builds a STABLE symlink /opt/flashshot/bin/node → the nvm node, so this unit
 # does not hardcode a versioned path. If you reinstall Node, just recreate the

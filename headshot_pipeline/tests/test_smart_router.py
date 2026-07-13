@@ -27,6 +27,12 @@ class TestSmartRouterHeroFace:
     def test_hero_face_prefers_high_fidelity(self, router):
         decision = router.route_for_task("hero_face")
         assert decision.confidence > 0.5
+        assert decision.provider in {"openrouter", "siliconflow", "chrome"}
+        assert decision.model not in {
+            "inswapper_128",
+            "realesrgan_x2_with_lanczos_fallback",
+            "flashshot_delivery_packager_v1",
+        }
         assert "identity" in decision.reason.lower() or "fidelity" in decision.reason.lower()
 
     def test_hero_face_latency_sensitive(self, router):
@@ -53,8 +59,7 @@ class TestSmartRouterLocalEdit:
 
     def test_local_edit_prefers_mask_edit(self, router):
         decision = router.route_for_task("local_edit")
-        # Should still return a provider even if no mask edit support
-        assert decision.provider != ""
+        assert decision.provider in {"openrouter", "siliconflow", "chrome"}
 
     def test_local_edit_identity_priority(self, router):
         decision = router.route_for_task("local_edit")
@@ -66,8 +71,8 @@ class TestSmartRouterUpscale:
 
     def test_upscale_routes_to_local(self, router):
         decision = router.route_for_task("upscale")
-        # Upscale should prefer local (free) providers
-        assert decision.estimated_cost == 0.0
+        assert decision.provider == "local"
+        assert decision.model == "realesrgan_x2_with_lanczos_fallback"
 
 
 class TestSmartRouterIdentityRepair:
@@ -75,8 +80,13 @@ class TestSmartRouterIdentityRepair:
 
     def test_identity_repair_routes_to_local(self, router):
         decision = router.route_for_task("identity_repair")
-        # Identity repair should use local provider
-        assert decision.estimated_cost == 0.0
+        assert decision.provider == "local"
+        assert decision.model == "inswapper_128"
+
+    def test_final_render_routes_only_to_packager(self, router):
+        decision = router.route_for_task("final_render")
+        assert decision.provider == "local"
+        assert decision.model == "flashshot_delivery_packager_v1"
 
 
 class TestSmartRouterCostSensitivity:
@@ -200,3 +210,14 @@ class TestSmartRouterTaskProfiles:
         profile = router.TASK_PROFILES["upscale"]
         assert profile.cost_sensitive is False
         assert profile.identity_priority == 0.90
+
+    @pytest.mark.parametrize(
+        ("task_type", "expected_model"),
+        [
+            ("identity_repair", "inswapper_128"),
+            ("upscale", "realesrgan_x2_with_lanczos_fallback"),
+            ("final_render", "flashshot_delivery_packager_v1"),
+        ],
+    )
+    def test_local_tasks_cannot_cross_route(self, router, task_type, expected_model):
+        assert router.route_for_task(task_type).model == expected_model

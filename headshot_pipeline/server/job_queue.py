@@ -32,7 +32,7 @@ from .delivery_policy import (
     image_passed_final_gate,
     image_or_source_passed_final_gate,
 )
-from .gemini_worker import GeminiWorker, identity_threshold_profile
+from .gemini_worker import GeminiWorker
 from .evaluation import EvaluationService
 from .image_gateway import build_provider_invocation_metadata
 from .input_quality import (
@@ -785,6 +785,7 @@ class JobQueue:
         self._ws_connections: dict[str, list[WebSocket]] = {}
         self._worker_task: asyncio.Task | None = None
         self._worker: GeminiWorker | None = None
+        self._worker_readiness_error: str | None = None
         self._prompts_data: dict | None = None
         self._learning_layer: LearningLayer | None = None
         # Per-session locks, created on demand. Guards submit/upload mutations.
@@ -796,6 +797,18 @@ class JobQueue:
             lock = asyncio.Lock()
             self._session_locks[session_id] = lock
         return lock
+
+    @property
+    def generation_ready(self) -> bool:
+        """Whether the process can accept generation work right now."""
+        if self._worker is None:
+            return False
+        readiness = getattr(self._worker, "provider_readiness", None)
+        return bool(isinstance(readiness, dict) and readiness.get("pass"))
+
+    @property
+    def worker_readiness_error(self) -> str | None:
+        return self._worker_readiness_error
 
     # Raw generated images use img_{8hex}; post-processed variants use
     # pp_{8hex}. Intermediates ({stem}_crop_* etc.) are deleted after copy, so
@@ -824,14 +837,20 @@ class JobQueue:
             print(f"⚠ Learning layer init failed ({exc}); running with static thresholds")
             self._learning_layer = None
         try:
-            self._worker = GeminiWorker()
+            self._worker = GeminiWorker(learning_layer=self._learning_layer)
             await asyncio.to_thread(self._worker.connect)
-            print("✓ OpenRouter Gemini API client ready")
-        except Exception as exc:
+            self._worker_readiness_error = None
+            readiness = self._worker.provider_readiness or {}
             print(
-                "⚠ OpenRouter Gemini client not ready (%s); generation jobs will "
-                "fail until OPENROUTER_API_KEY is set in .env and the API is "
-                "restarted." % exc
+                "✓ Image provider ready: %s / %s"
+                % (readiness.get("provider", "unknown"), readiness.get("model", "unknown"))
+            )
+        except Exception as exc:
+            self._worker_readiness_error = str(exc)
+            print(
+                "⚠ Image generation provider not ready (%s); verify the API key, "
+                "configured model, provider region availability, and outbound "
+                "network before restarting the API." % exc
             )
             self._worker = None
         self._worker_task = asyncio.create_task(self._process_loop())
@@ -1142,6 +1161,7 @@ class JobQueue:
                         score=score,
                         reason=reason,
                     )
+                    self._learning_layer.calibrate()
                 except Exception as exc:
                     print(f"⚠ Learning layer feedback recording failed: {exc}")
             return record
@@ -1555,14 +1575,19 @@ class JobQueue:
         if not self._worker:
             print("  ⏳ Worker not ready, attempting to construct API client...")
             try:
-                self._worker = GeminiWorker()
+                self._worker = GeminiWorker(learning_layer=self._learning_layer)
                 await asyncio.to_thread(self._worker.connect)
+                self._worker_readiness_error = None
                 print("  ✓ API client ready on retry")
             except Exception as exc:
+                self._worker_readiness_error = str(exc)
                 print(f"  ❌ Worker construction failed: {exc}")
                 self._worker = None
                 job.status = JobStatus.failed
-                job.error = "Gemini API not configured — set OPENROUTER_API_KEY in .env and restart the API"
+                job.error = (
+                    "Image generation provider is not ready — verify the API key, "
+                    "configured model, region availability, and restart the API"
+                )
                 await self._broadcast(job.session_id, {
                     "type": "job_failed",
                     "job_id": job.job_id,
@@ -1572,7 +1597,10 @@ class JobQueue:
 
         if not self._worker:
             job.status = JobStatus.failed
-            job.error = "Gemini API not configured — set OPENROUTER_API_KEY in .env and restart the API"
+            job.error = (
+                "Image generation provider is not ready — verify the API key, "
+                "configured model, region availability, and restart the API"
+            )
             await self._broadcast(job.session_id, {
                 "type": "job_failed",
                 "job_id": job.job_id,
@@ -1722,7 +1750,7 @@ class JobQueue:
                 )
                 revision_gate = EvaluationService._candidate_gate_status(
                     revision_judgement,
-                    identity_threshold_profile(shot_spec),
+                    self._worker.identity_thresholds_for_shot(shot_spec),
                 )
                 revision_deliverable = bool(revision_gate.get("hard_gates_pass"))
                 revision_candidate_id = f"revision_{job.job_id}"
@@ -1778,17 +1806,24 @@ class JobQueue:
             else:
                 raise ValueError(f"Unknown job type: {job.job_type}")
 
+            generation_job_types = {
+                JobType.generate,
+                JobType.hero_preview,
+                JobType.full_set,
+            }
+            gated_job_types = generation_job_types | {JobType.revise}
+
             delivery_gate_check = None
-            if job.job_type in {JobType.generate, JobType.revise}:
+            if job.job_type in gated_job_types:
                 delivery_gate_check = attach_delivery_gate_check(resemblance_meta)
 
             if (
-                job.job_type in {JobType.generate, JobType.revise}
+                job.job_type in gated_job_types
                 and not delivery_gate_check.get("pass")
             ):
                 job.status = JobStatus.failed
                 job.error = delivery_gate_failure_message(resemblance_meta)
-                if job.job_type == JobType.generate:
+                if job.job_type in generation_job_types:
                     _record_generation_failure(session, "delivery_gate_failed")
                     _record_shot_failure(
                         session,
@@ -1824,7 +1859,7 @@ class JobQueue:
                 })
                 return
 
-            if job.job_type in {JobType.generate, JobType.full_set}:
+            if job.job_type in generation_job_types:
                 existing_paths = [
                     session.output_dir / f"{img.image_id}.png"
                     for img in session.generated_images
@@ -1893,7 +1928,11 @@ class JobQueue:
             ai_label = copy_with_ai_metadata(
                 filepath,
                 dest,
-                operation="GENERATE" if job.job_type == JobType.generate else "REVISE",
+                operation=(
+                    "GENERATE"
+                    if job.job_type in generation_job_types
+                    else "REVISE"
+                ),
                 source="openrouter_gemini",
             )
             if isinstance(resemblance_meta, dict):
@@ -1908,12 +1947,12 @@ class JobQueue:
                         "final_asset_id": image_id,
                     }
                     final_eval_checks_pass = ai_label_check.get("pass")
-                    if job.job_type in {JobType.generate, JobType.revise}:
+                    if job.job_type in gated_job_types:
                         final_eval_checks_pass = (
                             final_eval_checks_pass
                             and (final_eval.get("delivery_gate") or {}).get("pass", False)
                         )
-                    if job.job_type == JobType.generate:
+                    if job.job_type in generation_job_types:
                         final_eval_checks_pass = (
                             final_eval_checks_pass
                             and (final_eval.get("duplicate_check") or {}).get("pass", True)
@@ -1932,7 +1971,7 @@ class JobQueue:
                     "operation": "FINAL_RENDER",
                 }
                 img.resemblance = resemblance_meta
-            if job.job_type in {JobType.generate, JobType.full_set, JobType.revise}:
+            if job.job_type in gated_job_types:
                 append_final_render_invocation(
                     resemblance_meta,
                     image_id,
@@ -2024,6 +2063,11 @@ class JobQueue:
                 "job_id": job.job_id,
                 "error": str(e),
             })
+        finally:
+            if self._worker is not None:
+                end_session = getattr(self._worker, "end_session", None)
+                if callable(end_session):
+                    end_session(job.session_id)
 
     # ── WebSocket management ──────────────────────────
 

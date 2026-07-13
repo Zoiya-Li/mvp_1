@@ -45,6 +45,13 @@ class _RevisionWorker:
     def _judge_current_candidate(self, image_path, reference_photo_paths=None):
         return self.judgement
 
+    def identity_thresholds_for_shot(self, shot_spec=None):
+        return {
+            "profile": "closeup",
+            "identity_pass_threshold": 8.0,
+            "identity_repair_threshold": 7.0,
+        }
+
 
 def _revision_judgement(identity: int = 9, artifact: int = 9) -> dict:
     return {
@@ -325,14 +332,16 @@ def test_real_worker_has_judge_current_candidate_delegate(tmp_path):
     assert spy.judge_calls[0]["reference_paths"] == ["ref1.jpg", "ref2.jpg"]
 
 
-def test_real_execute_revise_rejects_inactive_session(tmp_path):
+def test_real_execute_revise_establishes_its_own_session(tmp_path):
     w, _spy = _real_revise_worker(tmp_path)
     w.active_session_id = "other_session"
 
-    with pytest.raises(RuntimeError, match="not the active conversation"):
-        w.execute_revise(
-            "s_revision",
-            "brighter",
-            "t",
-            source_image_path=str(tmp_path / "parent.png"),
-        )
+    result = w.execute_revise(
+        "s_revision",
+        "brighter",
+        "t",
+        source_image_path=str(tmp_path / "parent.png"),
+    )
+
+    assert result == str(tmp_path / "revised.png")
+    assert w.active_session_id == "s_revision"

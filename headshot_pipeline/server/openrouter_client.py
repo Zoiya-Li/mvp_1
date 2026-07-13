@@ -3,7 +3,7 @@
 Replaces the headless-Chrome-CDP ``persistent_client.py`` for production. The
 Gemini web-UI driver (Selenium over a logged-in Chrome) was the single biggest
 source of "needs constant debugging": login expiry, DOM-selector drift, VNC
-login, profile locks. Driving ``gemini-3.1-flash-image-preview`` ("Nano Banana
+login, profile locks. Driving ``gemini-3.1-flash-image`` ("Nano Banana
 2") via the OpenRouter REST API removes that entire layer.
 
 Design — STATELESS multi-turn:
@@ -56,7 +56,7 @@ def _pil():
 
 
 DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
-DEFAULT_MODEL = "google/gemini-3.1-flash-image-preview"
+DEFAULT_MODEL = "google/gemini-3.1-flash-image"
 
 # Retries for transient transport errors (429 / 5xx). One retry with backoff —
 # the worker's judge loop already adds a second layer of fast-retry, so we keep
@@ -123,6 +123,30 @@ class OpenRouterGeminiClient:
         if not self.api_key:
             raise OpenRouterError("OPENROUTER_API_KEY not set")
         print(f"✓ OpenRouter API client ready (model={self.model})")
+
+    def check_model_access(self, timeout: int = 30) -> dict:
+        """Make a low-cost text probe against the configured image model.
+
+        A key-only check is insufficient: OpenRouter may authenticate the key
+        while the selected image model is unavailable in the caller's region.
+        The result is cached by the process-level worker, not called per health
+        request.
+        """
+        response = self._post(
+            [{"role": "user", "content": "Reply with exactly OK."}],
+            timeout=timeout,
+            modalities=["text"],
+        )
+        text = self._extract_text(response)
+        if not text:
+            raise OpenRouterError(
+                f"Model access probe returned no text for {self.model}"
+            )
+        return {
+            "pass": True,
+            "provider": "openrouter",
+            "model": self.model,
+        }
 
     def disconnect(self):
         """No-op. The API has no persistent connection to close."""

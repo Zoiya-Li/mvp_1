@@ -1,10 +1,10 @@
 # FlashShot — FastAPI server (Gemini headshot pipeline + Paddle payment).
 #
-# Runs uvicorn bound to LOOPBACK:8001 behind Caddy (:443 → :8001 for /api/* and
+# Runs uvicorn bound to LOOPBACK:8001 behind Caddy (:443 -> :8001 for /api/* and
 # /ws/*). It loads env from /opt/flashshot/.env (CWD-relative ".env", read by
 # pydantic-settings in server/config.py — that is the single source of truth,
-# so this unit does NOT use EnvironmentFile). Generation drives the OpenRouter
-# REST API (gemini-3.1-flash-image-preview) STATELESSLY — there is no browser
+# so this unit does NOT use EnvironmentFile). Generation drives the SiliconFlow
+# REST API STATELESSLY - there is no browser
 # process to attach to, so this unit has NO dependency on any chrome service.
 # (The old flashshot-chrome.service was retired with the Chrome→API pivot.)
 #
@@ -28,10 +28,10 @@ WorkingDirectory=/opt/flashshot
 
 # Single worker: the resemblance loop is serialized by the in-process job queue
 # (one generation at a time), and 1 worker keeps the shared-box RAM budget
-# honest. The OpenRouter API is stateless per-call, so the worker count is a
+# honest. The SiliconFlow API is stateless per-call, so the worker count is a
 # capacity dial, NOT a correctness constraint — raise it only if free RAM on
 # preflight.sh allows, and bump MemoryMax/MemoryHigh to match.
-ExecStart=/opt/flashshot/.venv/bin/uvicorn server.main:app \
+ExecStart=/opt/flashshot/.venv/bin/python -m uvicorn server.main:app \
   --host 127.0.0.1 \
   --port 8001 \
   --workers 1
@@ -39,8 +39,16 @@ ExecStart=/opt/flashshot/.venv/bin/uvicorn server.main:app \
 Restart=on-failure
 RestartSec=5
 
-MemoryMax=700M
-MemoryHigh=550M
+# Image processing spikes RAM well past the steady-state ~70 MB: each uploaded
+# reference photo is decoded full-res (cv2.imread → multi-MB numpy arrays, plus
+# Laplacian/gray/cascade buffers in input_quality.assess_reference_photo), and
+# generation loads onnxruntime + the inswapper model + postprocess buffers.
+# Observed OOM at anon-rss=712 MB on a 2-photo upload with the old 700 M limit.
+# This shared 3.8 GB host has about 2.6 GB available with co-tenants loaded.
+# A 1.5 GB ceiling covers the measured image-processing spike while preserving
+# at least ~1 GB for Syntropy, Caddy, the web process, and the OS.
+MemoryMax=1500M
+MemoryHigh=1200M
 
 NoNewPrivileges=true
 PrivateTmp=true
@@ -52,7 +60,7 @@ ProtectControlGroups=true
 # opencv / numpy / onnxruntime / mediapipe / rembg load large .so files; the
 # hardening above is as strict as the ML stack tolerates. Anything tighter
 # (e.g. RestrictAddressFamilies, SystemCallFilter) tends to break the import.
-# Network egress to openrouter.ai is NOT restricted (no IPAddressDeny), which
+# Network egress to api.siliconflow.cn is NOT restricted (no IPAddressDeny), which
 # is required — generation + judge calls leave the box over HTTPS.
 ReadWritePaths=/var/lib/flashshot
 

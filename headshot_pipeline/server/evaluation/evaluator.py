@@ -70,10 +70,22 @@ class EvaluationService:
         thresholds = identity_threshold_profile(shot_spec)
         if self._learning_layer is not None:
             cal = self._learning_layer.get_calibration()
-            # Override with calibrated values if we have enough samples
+            # Apply learned deltas to the geometry-specific profile. Replacing
+            # a small-face threshold with the global close-up threshold would
+            # make full-body shots impossible to pass.
             if cal.sample_count >= 10:
-                thresholds["identity_pass_threshold"] = cal.identity_pass_threshold
-                thresholds["identity_repair_threshold"] = cal.identity_repair_threshold
+                thresholds["identity_pass_threshold"] = round(
+                    float(thresholds["identity_pass_threshold"])
+                    + (cal.identity_pass_threshold - 8.0),
+                    3,
+                )
+                thresholds["identity_repair_threshold"] = round(
+                    float(thresholds["identity_repair_threshold"])
+                    + (cal.identity_repair_threshold - 7.0),
+                    3,
+                )
+                thresholds["calibration_sample_count"] = cal.sample_count
+                thresholds["calibrated"] = True
         return thresholds
 
     # ── Identity app lazy loader ──────────────────────────────
@@ -475,7 +487,7 @@ class EvaluationService:
                 cosine_threshold = cal.identity_cosine_accept
 
         score = EvaluationService._identity_cosine_to_score(cosine)
-        if score < IDENTITY_REPAIR_THRESHOLD:
+        if cosine < cosine_threshold:
             result["hard_failures"].append("identity_too_low")
 
         result.update({
@@ -667,7 +679,9 @@ class EvaluationService:
             for failure in ("no_face", "identity_no_generated_face")
         )
         identity_pass = (
-            identity is not None and identity >= identity_pass_threshold
+            identity is not None
+            and identity >= identity_pass_threshold
+            and "identity_too_low" not in failures
         )
         severe_quality_fail = any(
             failure in failures

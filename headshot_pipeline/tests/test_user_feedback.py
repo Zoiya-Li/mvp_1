@@ -309,6 +309,40 @@ async def test_queue_records_and_persists_user_feedback(tmp_db):
 
 
 @pytest.mark.asyncio
+async def test_identity_feedback_triggers_learning_calibration(tmp_db):
+    class FakeLearningLayer:
+        def __init__(self):
+            self.recorded = []
+            self.calibrate_calls = 0
+
+        def record_feedback(self, **kwargs):
+            self.recorded.append(kwargs)
+
+        def calibrate(self):
+            self.calibrate_calls += 1
+
+    q = JobQueue()
+    q._learning_layer = FakeLearningLayer()
+    state = _state_with_images()
+    state.upload_dir = settings.upload_dir / state.session_id
+    state.output_dir = settings.output_dir / state.session_id
+    state.upload_dir.mkdir(parents=True)
+    state.output_dir.mkdir(parents=True)
+    q._sessions[state.session_id] = state
+
+    await q.record_user_feedback(
+        state.session_id,
+        "img_good",
+        FeedbackEvent.not_like_me,
+        reason="jawline drift",
+        score=0,
+    )
+
+    assert q._learning_layer.recorded[0]["event"] == "not_like_me"
+    assert q._learning_layer.calibrate_calls == 1
+
+
+@pytest.mark.asyncio
 async def test_queue_rejects_saved_feedback_for_non_deliverable_image(tmp_db):
     q = JobQueue()
     state = _state_with_images()

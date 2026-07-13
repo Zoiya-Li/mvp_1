@@ -2,7 +2,7 @@
 # FlashShot deploy — READ-ONLY preflight audit of the shared VPS.
 #
 # Prints a go/no-go report. TOUCHES NOTHING. Safe to run on a box shared with
-# Syntropy / Caddy / Tailscale / fwxt-relay — every command below is read-only
+# Syntropy / Caddy / Tailscale / fwxt-relay - every command below is read-only
 # (systemctl status / list-unit-files, ss -ltn, free, df, whoami, test -e).
 # No file is written, no service is started/stopped/reloaded.
 #
@@ -30,8 +30,8 @@ if [ -r /etc/os-release ]; then
   . /etc/os-release
   echo "  ${PRETTY_NAME:-unknown}"
   case "${ID:-}/${VERSION_ID:-}" in
-    ubuntu/24*) ok "Ubuntu 24.04 (matches the tested target)" ;;
-    ubuntu/2*)  wa "Ubuntu ${VERSION_ID:-?} — units expect 24.04 paths" ;;
+    ubuntu/20*|ubuntu/24*) ok "Ubuntu ${VERSION_ID:-?} (tested with the uv-managed Python runtime)" ;;
+    ubuntu/2*)  wa "Ubuntu ${VERSION_ID:-?} - verify the uv-managed Python runtime" ;;
     debian/*)   wa "Debian — close to Ubuntu, verify node paths" ;;
     *)          wa "${ID:-unknown} — untested; adapt package names" ;;
   esac
@@ -39,13 +39,13 @@ fi
 [ "$(uname -m)" = "x86_64" ] && ok "x86_64 arch" || wa "arch $(uname -m) — units assume amd64"
 
 # ── RAM budget ──
-hdr "Memory budget (shared 3.8 GB; FlashShot units cap at ~1.1 GB)"
+hdr "Memory budget (shared 3.8 GB; FlashShot units cap at ~1.9 GB)"
 memtotal_m=$(awk '/MemTotal/     {print int($2/1024)}' /proc/meminfo)
 memavail_m=$(awk '/MemAvailable/ {print int($2/1024)}' /proc/meminfo)
 echo "  MemTotal     ${memtotal_m} MB"
 echo "  MemAvailable ${memavail_m} MB"
-[ "${memavail_m:-0}" -ge 1200 ] && ok "≥1.2 GB available now" \
-  || wa "low free RAM (${memavail_m} MB) — API+Web will contend with co-tenants"
+[ "${memavail_m:-0}" -ge 2200 ] && ok "≥2.2 GB available now" \
+  || no "only ${memavail_m} MB available - below the API 1.5 GB + Web 0.4 GB safety budget"
 
 # ── Disk ──
 hdr "Disk"
@@ -58,7 +58,8 @@ hdr "Co-tenant services (expected — will be left untouched)"
 found_cotenant=0
 for s in caddy tailscaled fwxt-relay; do
   if systemctl list-unit-files "${s}.service" >/dev/null 2>&1; then
-    st=$(systemctl is-active "${s}.service" 2>/dev/null || echo unknown)
+    st=$(systemctl is-active "${s}.service" 2>/dev/null)
+    [ -n "${st}" ] || st=unknown
     ok "${s}.service present (${st})"
     found_cotenant=1
   fi
@@ -69,8 +70,14 @@ done
 hdr "Port checks (8001 api / 3001 web — loopback only)"
 for p in 8001 3001; do
   if ss -ltn 2>/dev/null | awk '{print $4}' | grep -q ":${p}\$"; then
-    no "port ${p} already in use"
-    ss -ltnp 2>/dev/null | awk -v p=":${p}" '$4 ~ p {print "      "$0}'
+    unit="flashshot-api"
+    [ "${p}" = "3001" ] && unit="flashshot-web"
+    if systemctl is-active --quiet "${unit}.service"; then
+      ok "port ${p} is owned by active ${unit}.service (upgrade-safe)"
+    else
+      no "port ${p} already in use by a non-FlashShot process"
+      ss -ltnp 2>/dev/null | awk -v p=":${p}" '$4 ~ p {print "      "$0}'
+    fi
   else
     ok "port ${p} free"
   fi
@@ -78,12 +85,16 @@ done
 
 # ── Software prerequisites ──
 # NOTE: no google-chrome / xvfb / x11vnc anymore — generation drives the
-# OpenRouter REST API, so there is no browser to install or log into.
+# SiliconFlow REST API, so there is no browser to install or log into.
 hdr "Software"
-if [ -x /usr/bin/node ]; then
-  ok "node $(/usr/bin/node -v 2>/dev/null)"
+node_bin=""
+for candidate in /usr/bin/node /opt/flashshot/bin/node; do
+  if [ -x "${candidate}" ]; then node_bin="${candidate}"; break; fi
+done
+if [ -n "${node_bin}" ]; then
+  ok "node $("${node_bin}" -v 2>/dev/null) at ${node_bin}"
 else
-  wa "/usr/bin/node missing — runbook §2 builds Node under /opt/flashshot/.nvm"
+  no "node missing from /usr/bin and /opt/flashshot/bin"
 fi
 if command -v python3 >/dev/null 2>&1; then
   ok "python3 $(python3 --version 2>&1)"
@@ -96,9 +107,9 @@ else
   no "python3-venv missing (apt: python3.12-venv)"
 fi
 if command -v caddy >/dev/null 2>&1; then
-  ok "caddy present (managed by co-tenant — reload only, never reconfigure)"
+  ok "caddy present (shared ingress - validate before reload)"
 else
-  no "caddy missing — nothing terminates TLS for flashshot.top"
+  no "caddy missing - nothing terminates TLS for flashshot.top"
 fi
 
 # ── Isolation user ──
@@ -113,7 +124,12 @@ fi
 hdr "Deploy paths"
 for d in /opt/flashshot /var/lib/flashshot /var/lib/flashshot/data; do
   if [ -e "${d}" ]; then
-    wa "${d} already exists — verify ownership/contents before reusing"
+    owner=$(stat -c '%U:%G' "${d}" 2>/dev/null || echo unknown)
+    if [ "${owner}" = "flashshot:flashshot" ]; then
+      ok "${d} exists with dedicated-user ownership (upgrade-safe)"
+    else
+      wa "${d} exists with ownership ${owner} - verify before reusing"
+    fi
   else
     ok "${d} absent (will be created)"
   fi
@@ -121,17 +137,21 @@ done
 
 # ── Caddyfile ──
 hdr "Caddyfile"
-caddyfile=""
-for f in /etc/caddy/Caddyfile /etc/caddy/caddy.json; do
-  if [ -e "${f}" ]; then caddyfile="${f}"; break; fi
-done
-if [ -n "${caddyfile}" ]; then
-  ok "Caddyfile at ${caddyfile} — APPEND flashshot block, never replace"
+caddyfile="/etc/caddy/Caddyfile"
+if [ -e "${caddyfile}" ]; then
+  ok "Caddyfile exists at ${caddyfile}"
+  if caddy validate --config "${caddyfile}" >/dev/null 2>&1; then
+    ok "Caddy configuration validates"
+  else
+    no "Caddy configuration validation failed"
+  fi
   if grep -q 'flashshot\.top' "${caddyfile}" 2>/dev/null; then
-    wa "flashshot.top already mentioned in ${caddyfile} — avoid a duplicate site block"
+    ok "flashshot.top site block already present (upgrade-safe)"
+  else
+    wa "flashshot.top site block absent - append Caddyfile.flashshot once"
   fi
 else
-  no "no Caddyfile found at the usual paths — locate it before editing"
+  no "${caddyfile} is missing"
 fi
 
 # ── Result ──

@@ -34,6 +34,7 @@ class ProviderCapabilities:
     max_reference_images: int
     average_latency_ms: int
     estimated_cost: float
+    supported_tasks: tuple[str, ...]
 
 
 OPENROUTER_GEMINI_CAPABILITIES = ProviderCapabilities(
@@ -47,6 +48,33 @@ OPENROUTER_GEMINI_CAPABILITIES = ProviderCapabilities(
     max_reference_images=4,
     average_latency_ms=18_000,
     estimated_cost=0.12,
+    supported_tasks=(
+        "hero_face",
+        "half_body",
+        "full_body",
+        "environmental",
+        "local_edit",
+    ),
+)
+
+SILICONFLOW_QWEN_CAPABILITIES = ProviderCapabilities(
+    provider="siliconflow",
+    model=settings.siliconflow_image_model,
+    supports_multiple_references=True,
+    supports_mask_edit=False,
+    supports_high_fidelity=True,
+    supports_seed=True,
+    supports_portrait_ratio=True,
+    max_reference_images=3,
+    average_latency_ms=42_000,
+    estimated_cost=settings.siliconflow_estimated_image_cost,
+    supported_tasks=(
+        "hero_face",
+        "half_body",
+        "full_body",
+        "environmental",
+        "local_edit",
+    ),
 )
 
 CHROME_GEMINI_CAPABILITIES = ProviderCapabilities(
@@ -60,6 +88,13 @@ CHROME_GEMINI_CAPABILITIES = ProviderCapabilities(
     max_reference_images=4,
     average_latency_ms=45_000,
     estimated_cost=0.0,
+    supported_tasks=(
+        "hero_face",
+        "half_body",
+        "full_body",
+        "environmental",
+        "local_edit",
+    ),
 )
 
 LOCAL_IDENTITY_REPAIR_CAPABILITIES = ProviderCapabilities(
@@ -73,6 +108,7 @@ LOCAL_IDENTITY_REPAIR_CAPABILITIES = ProviderCapabilities(
     max_reference_images=8,
     average_latency_ms=2_000,
     estimated_cost=0.0,
+    supported_tasks=("identity_repair",),
 )
 
 LOCAL_FINAL_RENDER_CAPABILITIES = ProviderCapabilities(
@@ -86,6 +122,7 @@ LOCAL_FINAL_RENDER_CAPABILITIES = ProviderCapabilities(
     max_reference_images=0,
     average_latency_ms=250,
     estimated_cost=0.0,
+    supported_tasks=("final_render",),
 )
 
 LOCAL_UPSCALE_CAPABILITIES = ProviderCapabilities(
@@ -99,6 +136,7 @@ LOCAL_UPSCALE_CAPABILITIES = ProviderCapabilities(
     max_reference_images=0,
     average_latency_ms=5_000,
     estimated_cost=0.0,
+    supported_tasks=("upscale",),
 )
 
 
@@ -111,6 +149,8 @@ def provider_for_operation(operation: ImageOperation) -> ProviderCapabilities:
         return LOCAL_FINAL_RENDER_CAPABILITIES
     if getattr(settings, "gemini_backend", "openrouter") == "chrome":
         return CHROME_GEMINI_CAPABILITIES
+    if getattr(settings, "gemini_backend", "openrouter") == "siliconflow":
+        return SILICONFLOW_QWEN_CAPABILITIES
     return OPENROUTER_GEMINI_CAPABILITIES
 
 

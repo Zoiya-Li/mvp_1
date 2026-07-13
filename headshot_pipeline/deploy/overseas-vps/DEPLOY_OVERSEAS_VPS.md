@@ -10,11 +10,12 @@
 > reorder, or remove anything belonging to another project. The rollback (§11)
 > removes *only* FlashShot and leaves every co-tenant untouched.
 >
-> **Generation backend:** the pipeline drives `gemini-3.1-flash-image-preview`
-> via the **OpenRouter REST API** — a stateless HTTPS call per turn. There is
+> **Generation backend:** the pipeline drives Qwen Image Edit and Qwen3.6 VLM
+> via the **SiliconFlow REST API** - stateless HTTPS calls per turn. There is
 > **no Chrome / no browser / no VNC login** anymore (that was retired with the
 > Chrome→API pivot; it was the single biggest source of "needs constant
-> debugging"). The only secret generation needs is `OPENROUTER_API_KEY`.
+> debugging"). The production generation backend is SiliconFlow; its only
+> generation secret is `SILICONFLOW_API_KEY`.
 
 This runbook is a set of commands **you run yourself** on the VPS. Claude does
 not SSH into the shared box. Read every block before pasting it.
@@ -42,27 +43,23 @@ not SSH into the shared box. Read every block before pasting it.
                 └──────────────────────┬──────────────────────────────┘
                                        │ HTTPS egress only (no ingress)
                                        ▼
-                       openrouter.ai/api/v1  →  gemini-3.1-flash-image-preview
+                       api.siliconflow.cn/v1 → Qwen Image Edit + Qwen3.6 VLM
 ```
 
 | Unit | Port | Binds to | Purpose |
 |------|------|----------|---------|
-| `flashshot-api.service` | 8001 | **127.0.0.1** | FastAPI: pipeline + Paddle payment + WS; calls OpenRouter over HTTPS |
+| `flashshot-api.service` | 8001 | **127.0.0.1** | FastAPI: pipeline + Paddle payment + WS; calls SiliconFlow over HTTPS |
 | `flashshot-web.service` | 3001 | **127.0.0.1** | Next.js marketing + upload/review UI |
 
 Both bind to **loopback only** — they are never directly reachable from
 the internet. Caddy is the sole ingress and multiplexes by hostname, so a
 misconfiguration in the flashshot block physically cannot affect other sites.
 
-**RAM budget (honest):** the box has ~3.8 GB shared. The two units are capped
-at API 0.7 GB + Web 0.4 GB ≈ **1.1 GB ceiling** — markedly lighter than the
-retired Chrome stack (Chrome alone ate ~1.6 GB). Generation is now an outbound
-HTTPS call, so it costs ~no resident RAM on this box; the job queue still
-serializes to **one generation at a time** to keep OpenRouter spend + latency
-predictable. If `MemAvailable` reported by `preflight.sh` is < ~1.2 GB after
-co-tenants are loaded, treat this as a low-volume MVP host or move FlashShot to
-its own $6/mo VPS. Do not raise the `MemoryMax` caps without confirming free
-RAM; the trading firm next door must never be collateral damage.
+**RAM budget (honest):** image decoding, InsightFace, ONNX and post-processing
+can spike well above steady-state memory. On this shared 3.8 GB host the units
+are capped at API 1.5 GB + Web 0.4 GB ≈ **1.9 GB ceiling**. The in-process queue
+serializes generation to one job at a time. `preflight.sh` returns NO-GO below
+2.2 GB available; do not raise these caps without re-auditing every co-tenant.
 
 ---
 
@@ -94,7 +91,7 @@ NodeSource / Google-Chrome steps; they do not touch co-tenant services.
 
 ```bash
 # Python venv module (Ubuntu 24.04 splits it out). No xvfb/x11vnc, no Chrome —
-# generation drives the OpenRouter API, so there is nothing graphical to install
+# generation drives the SiliconFlow API, so there is nothing graphical to install
 # or log into.
 sudo apt-get update
 sudo apt-get install -y python3.12-venv
@@ -133,7 +130,14 @@ From your **laptop**, push the two repos:
 
 ```bash
 # Backend pipeline (includes server/ + prompts.json + deploy/).
+#
+# CRITICAL: '.env' MUST be excluded. The laptop headshot_pipeline/.env holds DEV
+# secrets, while /opt/flashshot/.env on the server holds PROD secrets (prod
+# SiliconFlow key, SESSION_SECRET_KEY, Paddle keys). Without this exclude, the
+# rsync + `cp -a` below silently overwrites prod secrets with dev ones —
+# breaking production on the next restart.
 rsync -avz --exclude '__pycache__' --exclude '.venv' --exclude 'output' \
+  --exclude '.env' --exclude '.git' --exclude '.pytest_cache' \
   /Users/lizeyan/Desktop/mvp_1/headshot_pipeline/ \
   root@66.175.213.242:/tmp/flashshot-src-pipeline/
 
@@ -156,8 +160,15 @@ sudo -u flashshot bash -lc '
   python3 -m venv .venv
   .venv/bin/pip install --upgrade pip
   .venv/bin/pip install -r requirements.txt
-  # Sanity: the app imports + the Paddle regression suite is green.
-  .venv/bin/python -m pytest tests/ -q
+  # Test deps. pytest-asyncio is mandatory — without it async tests are
+  # silently skipped (PytestUnknownMarkWarning) and the gate looks green
+  # while exercising none of the async pipeline.
+  .venv/bin/pip install -r requirements-dev.txt
+  # Sanity gate. Run against an ISOLATED DATA_DIR so the suite never touches
+  # the live /var/lib/flashshot DBs. (Running pytest as root against the real
+  # data_dir once left root-owned learning_layer.db files that the flashshot
+  # service then could not write — "attempt to write a readonly database".)
+  DATA_DIR="$(mktemp -d)" .venv/bin/python -m pytest tests/ -q
 '
 
 # ── Frontend ──
@@ -185,39 +196,44 @@ sudo -u flashshot bash -lc '
 sudo -u flashshot install -m600 /dev/stdin /opt/flashshot/.env <<'EOF'
 HOST=127.0.0.1
 PORT=8001
+APP_ENVIRONMENT=staging
 CORS_ORIGINS=["http://localhost:3000","https://flashshot.top","https://www.flashshot.top"]
 
 # Generate on the box: python3 -c "import secrets;print(secrets.token_urlsafe(48))"
 SESSION_SECRET_KEY=REPLACE_WITH_OUTPUT_OF_THE_ABOVE_COMMAND
 
-# ── Generation backend (OpenRouter API — NO browser, NO login) ──
-# Paste your OpenRouter key (sk-or-v1-…). The worker refuses to start if this
+# ── Generation backend (SiliconFlow API - NO browser, NO login) ──
+# Paste your SiliconFlow key. The worker refuses to start if this
 # is empty: there is no logged-in Chrome session to fall back to anymore.
-OPENROUTER_API_KEY=PASTE_YOUR_OPENROUTER_KEY_HERE
-GEMINI_MODEL=google/gemini-3.1-flash-image-preview
-OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
+GEMINI_BACKEND=siliconflow
+SILICONFLOW_API_KEY=PASTE_YOUR_SILICONFLOW_KEY_HERE
+SILICONFLOW_BASE_URL=https://api.siliconflow.cn/v1
+SILICONFLOW_IMAGE_MODEL=Qwen/Qwen-Image-Edit-2509
+SILICONFLOW_TEXT_TO_IMAGE_MODEL=Qwen/Qwen-Image
+SILICONFLOW_JUDGE_MODEL=Qwen/Qwen3.6-35B-A3B
 GEMINI_WAIT_TIMEOUT=180
 
 PAYMENT_MOCK_ENABLED=0
 PADDLE_ENVIRONMENT=sandbox
 PADDLE_API_KEY=
+PADDLE_CLIENT_TOKEN=
 PADDLE_WEBHOOK_SECRET=
 PADDLE_PRICE_STANDARD_ID=
 PADDLE_PRICE_PREMIUM_ID=
-PADDLE_RETURN_URL=https://flashshot.top
+PADDLE_RETURN_URL=https://flashshot.top/checkout
 
 DATA_DIR=/var/lib/flashshot/data
 RETENTION_DAYS=7
 MAX_FILE_SIZE_MB=10
-MAX_PHOTOS=8
-MIN_PHOTOS=2
+MAX_PHOTOS=6
+MIN_PHOTOS=4
 
 # Overseas build: leave EMPTY so the footer hides the ICP block.
 ICP_BEIAN=
 EOF
 ```
 
-Fill the **OpenRouter key** (paste your `sk-or-v1-…` after `OPENROUTER_API_KEY=`)
+Fill the **SiliconFlow key** after `SILICONFLOW_API_KEY=`
 and the **Paddle values** (from §9). Generate the session secret:
 
 ```bash
@@ -227,14 +243,15 @@ sudo -u flashshot bash -lc 'python3 -c "import secrets;print(secrets.token_urlsa
 
 ---
 
-## 6. Generation backend — OpenRouter API (no login step)
+## 6. Generation backend — SiliconFlow API (no login step)
 
 > **This replaces the old "one-time Chrome / VNC login" step entirely.** There
 > is no browser, no Google login, no VNC, no profile to expire. Generation is a
-> stateless HTTPS call to OpenRouter driving `gemini-3.1-flash-image-preview`.
+> stateless HTTPS calls to SiliconFlow: Qwen Image Edit generates and repairs
+> portraits, while Qwen3.6 VLM judges candidate quality.
 
-The only thing the backend needs is the **OpenRouter API key** you already put
-in `/opt/flashshot/.env` (§5: `OPENROUTER_API_KEY=`). Verify it is set and the
+The only thing the backend needs is the **SiliconFlow API key** you already put
+in `/opt/flashshot/.env` (§5: `SILICONFLOW_API_KEY=`). Verify it is set and the
 worker constructs cleanly:
 
 ```bash
@@ -244,15 +261,15 @@ sudo -u flashshot bash -lc '
   .venv/bin/python -c "
 from server.config import settings
 from server.gemini_worker import GeminiWorker
-assert settings.openrouter_api_key, \"OPENROUTER_API_KEY is empty in .env\"
-GeminiWorker().connect()   # validates the key is non-empty + prints ready
-print(\"OK — OpenRouter Gemini client ready\")
+assert settings.siliconflow_api_key, \"SILICONFLOW_API_KEY is empty in .env\"
+GeminiWorker().connect()   # validates auth and both configured model IDs
+print(\"OK - SiliconFlow image and judge models ready\")
 "
 '
 ```
 
-If that prints `OK — OpenRouter Gemini client ready`, §6 is done — skip to §7.
-If it raises `OPENROUTER_API_KEY is not set`, go back and fill §5.
+If that prints `OK - SiliconFlow image and judge models ready`, §6 is done.
+If it raises `SILICONFLOW_API_KEY is not set`, go back and fill §5.
 
 ### Retiring a previously-installed Chrome stack (only if this box ever ran the old units)
 
@@ -298,10 +315,13 @@ sudo systemctl --no-pager --type=service | grep flashshot
 If `flashshot-api` enters `activating` then `failed`, check
 `journalctl -u flashshot-api -n 50 --no-pager`. The most common cause is a
 malformed `/opt/flashshot/.env` (pydantic-settings is strict) or an empty
-`OPENROUTER_API_KEY` — the worker refuses to start without it (see §6). Confirm:
+`SILICONFLOW_API_KEY`. Startup lists the account's available models without
+generating a paid image; an invalid model ID, outbound-network failure, or
+regional provider restriction keeps `/api/ready` at 503. Confirm:
 
 ```bash
-curl -sf http://127.0.0.1:8001/api/health                    # {"status":"ok",...}
+curl -sf http://127.0.0.1:8001/api/health                    # process liveness
+curl -sf http://127.0.0.1:8001/api/ready                     # generation readiness
 curl -sf http://127.0.0.1:3001/ -o /dev/null -w '%{http_code}\n'   # 200
 ```
 
@@ -334,6 +354,7 @@ Confirm TLS came up:
 
 ```bash
 curl -sfI https://flashshot.top/api/health | head -5    # HTTP/2 200, valid cert
+curl -sfI https://flashshot.top/api/ready | head -5     # HTTP/2 200, ready to accept work
 curl -sfI https://flashshot.top/             | head -5    # served by Next.js
 ```
 
@@ -356,10 +377,12 @@ In the Paddle dashboard (sandbox first):
    (Standard)** and **$10.00 (Pro)**. Copy each `pri_…` →
    `PADDLE_PRICE_STANDARD_ID=` / `PADDLE_PRICE_PREMIUM_ID=`.
 
-Then set `PADDLE_ENVIRONMENT=sandbox`, restart the API, and run a sandbox
+Keep `APP_ENVIRONMENT=staging` with `PADDLE_ENVIRONMENT=sandbox`, restart the API, and run a sandbox
 checkout end-to-end (upload → pay with Paddle's sandbox card → webhook marks
 the session paid → download). When green, flip `PADDLE_ENVIRONMENT=production`
-with the **production** API key + price IDs and restart the API again.
+with the **production** API key + price IDs, set `APP_ENVIRONMENT=production`,
+and restart the API again. Production readiness remains 503 until all required
+secrets, price IDs, the face-swap model and generation worker are present.
 
 ```bash
 # After editing .env:
@@ -413,20 +436,19 @@ or fwxt-relay. Step 2 reloads Caddy only after `validate` passes.
 ## 12. Known limitations / ops notes
 
 - **Serialized generation.** The in-process job queue runs one generation at a
-  time (keeps OpenRouter spend + latency predictable, and fits the shared-box
+  time (keeps SiliconFlow spend + latency predictable, and fits the shared-box
   RAM budget). The `--workers` count in `flashshot-api.service` is a capacity
   dial, not a correctness constraint — raise it only with confirmed free RAM.
-- **OpenRouter is the single external dependency for generation.** No Google
+- **SiliconFlow is the single external dependency for generation.** No Google
   login, no profile, no expiry to babysit. If generation jobs start failing,
-  check (a) `OPENROUTER_API_KEY` still set in `/opt/flashshot/.env`, (b) the
-  key's credit balance / rate limit on the OpenRouter dashboard, (c)
-  `journalctl -u flashshot-api` for `OpenRouterError` / 429 / 5xx. The client
-  retries once on transient 429/5xx; persistent failures surface as a job
+  check (a) `SILICONFLOW_API_KEY` still set in `/opt/flashshot/.env`, (b) the
+  key's credit balance / rate limit on the SiliconFlow dashboard, (c)
+  `journalctl -u flashshot-api` for `SiliconFlowError` / 429 / 5xx. The client
+  retries twice on transient 429/5xx; persistent failures surface as a job
   failure to the user.
-- **API output carries no visible watermark** (verified: the Chrome web-UI's
-  "Gemini" badge does NOT appear on OpenRouter image output), so no
-  watermark-stripping step is needed. SynthID is an invisible pixel-level mark
-  and is not user-visible.
+- **Generated URLs are downloaded immediately.** SiliconFlow response URLs are
+  temporary, so the adapter validates and stores every result as a local PNG
+  before the job proceeds.
 - **No amount verification on the webhook.** Paddle is the Merchant of Record
   and the price is pinned server-side by `price_id`; the HMAC signature +
   `custom_data.payment_id` binding is the security guarantee. This is

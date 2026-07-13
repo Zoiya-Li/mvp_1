@@ -11,7 +11,13 @@ from typing import Literal
 
 from ..config import settings
 from ..image_gateway import ImageOperation, provider_for_operation
-from .providers import ChromeProvider, ImageProvider, OpenRouterProvider
+from .providers import (
+    ChromeProvider,
+    ImageProvider,
+    OpenRouterProvider,
+    SiliconFlowError,
+    SiliconFlowProvider,
+)
 from .smart_router import SmartModelRouter
 
 ImageOperation = Literal[
@@ -31,6 +37,7 @@ class ImageGateway:
 
     def __init__(self) -> None:
         self._openrouter: OpenRouterProvider | None = None
+        self._siliconflow: SiliconFlowProvider | None = None
         self._chrome: ChromeProvider | None = None
         self._smart_router = SmartModelRouter()
         self._init_providers()
@@ -47,6 +54,20 @@ class ImageGateway:
                 output_dir=str(settings.output_dir),
                 model=settings.gemini_model,
                 base_url=settings.openrouter_base_url,
+                timeout=settings.gemini_wait_timeout,
+            )
+        elif settings.gemini_backend == "siliconflow":
+            if not settings.siliconflow_api_key:
+                raise SiliconFlowError(
+                    "SILICONFLOW_API_KEY is not set and gemini_backend is siliconflow."
+                )
+            self._siliconflow = SiliconFlowProvider(
+                api_key=settings.siliconflow_api_key,
+                output_dir=str(settings.output_dir),
+                image_model=settings.siliconflow_image_model,
+                text_to_image_model=settings.siliconflow_text_to_image_model,
+                judge_model=settings.siliconflow_judge_model,
+                base_url=settings.siliconflow_base_url,
                 timeout=settings.gemini_wait_timeout,
             )
         elif settings.gemini_backend == "chrome":
@@ -72,6 +93,8 @@ class ImageGateway:
         This is the entry point for task-aware model selection.
         Business code should call this before operations to log routing decisions.
         """
+        if not hasattr(self, "_smart_router"):
+            self._smart_router = SmartModelRouter()
         decision = self._smart_router.route_for_task(
             task_type=task_type,  # type: ignore[arg-type]
             shot_spec=shot_spec,
@@ -92,12 +115,19 @@ class ImageGateway:
     def _provider_for(self, operation: ImageOperation) -> ImageProvider:
         """Return the active provider for a given operation."""
         cap = provider_for_operation(operation)
-        if cap.provider == "chrome" and self._chrome is not None:
-            return self._chrome
-        if self._openrouter is not None:
-            return self._openrouter
-        if self._chrome is not None:
-            return self._chrome
+        chrome = getattr(self, "_chrome", None)
+        siliconflow = getattr(self, "_siliconflow", None)
+        openrouter = getattr(self, "_openrouter", None)
+        if cap.provider == "chrome" and chrome is not None:
+            return chrome
+        if cap.provider == "siliconflow" and siliconflow is not None:
+            return siliconflow
+        if openrouter is not None:
+            return openrouter
+        if siliconflow is not None:
+            return siliconflow
+        if chrome is not None:
+            return chrome
         raise RuntimeError("No image provider is configured.")
 
     # -- public semantic API --
@@ -159,9 +189,18 @@ class ImageGateway:
 
     def end_session(self) -> None:
         """Clean up all provider-side session state."""
-        for p in (self._openrouter, self._chrome):
+        for p in (
+            getattr(self, "_openrouter", None),
+            getattr(self, "_siliconflow", None),
+            getattr(self, "_chrome", None),
+        ):
             if p is not None:
                 try:
                     p.end_session()
                 except Exception:
                     pass
+
+    def check_readiness(self) -> dict:
+        """Probe the active generation provider once during worker startup."""
+        provider = self._provider_for("CREATE_FROM_REFERENCES")
+        return provider.check_readiness()

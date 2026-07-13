@@ -49,7 +49,7 @@ async def create_payment(
 ):
     """Create a payment order for upgrading tier.
 
-    Returns a Paddle hosted ``checkout_url`` the browser redirects to. Order
+    Returns an approved Paddle.js ``checkout_url`` the browser redirects to. Order
     creation calls Paddle's API (network) so it runs off the event loop.
     """
     # Don't allow downgrading
@@ -77,15 +77,22 @@ async def get_session_payment(session_id: str, state=Depends(require_owner)):
     return PaymentService.get_payment_for_session(session_id)
 
 
-@router.get("/payment/{payment_id}/status", response_model=PaymentStatusResponse)
-async def poll_payment_status(payment_id: str):
+@router.get(
+    "/{session_id}/payment/{payment_id}/status",
+    response_model=PaymentStatusResponse,
+)
+async def poll_payment_status(
+    session_id: str,
+    payment_id: str,
+    state=Depends(require_owner),
+):
     """Poll payment status (frontend calls this every few seconds).
 
     READ-ONLY. Does not upgrade the tier — only the verified webhook does that.
     The tier in the response reflects whatever the webhook has already applied.
     """
     record = PaymentService.get_payment(payment_id)
-    if not record:
+    if not record or record.session_id != session_id:
         raise HTTPException(404, "Payment not found")
     return PaymentStatusResponse(
         payment_id=record.payment_id,
@@ -126,15 +133,16 @@ def verify_paddle_signature(raw_body: bytes, paddle_signature: str,
     """
     if not paddle_signature or not secret:
         return False
-    parts: dict[str, str] = {}
+    parts: dict[str, list[str]] = {}
     for chunk in paddle_signature.split(";"):
         if "=" in chunk:
             key, val = chunk.split("=", 1)
-            parts[key.strip()] = val.strip()
-    ts = parts.get("ts")
-    h1 = parts.get("h1")
-    if not ts or not h1:
+            parts.setdefault(key.strip(), []).append(val.strip())
+    timestamps = parts.get("ts", [])
+    signatures = parts.get("h1", [])
+    if len(timestamps) != 1 or not signatures:
         return False
+    ts = timestamps[0]
 
     # Freshness: reject stale timestamps.
     try:
@@ -148,7 +156,7 @@ def verify_paddle_signature(raw_body: bytes, paddle_signature: str,
     expected = hmac.new(
         secret.encode("utf-8"), signed, hashlib.sha256
     ).hexdigest()
-    return hmac.compare_digest(expected, h1)
+    return any(hmac.compare_digest(expected, signature) for signature in signatures)
 
 
 @webhook_router.post("/paddle/webhook")

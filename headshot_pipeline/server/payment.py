@@ -20,7 +20,7 @@ PADDLE INTEGRATION (Billing, paddle.com):
     PADDLE_RETURN_URL         — post-checkout redirect target
 
   When those are present, ``create_order`` calls Paddle's transactions API to
-  obtain a hosted ``checkout.url`` (the browser is redirected there) and the
+  obtain a ``checkout.url`` on the approved Paddle.js page and the
   webhook verifies the HMAC-SHA256 ``Paddle-Signature`` before marking paid.
   When they are absent AND mock is off, ``create_order`` raises a clear error —
   it never silently gives away premium.
@@ -41,6 +41,7 @@ import hmac
 import json
 import re
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from datetime import datetime
@@ -100,6 +101,7 @@ class PaymentService:
     def is_paddle_configured() -> bool:
         return all([
             settings.paddle_api_key,
+            settings.paddle_client_token,
             settings.paddle_webhook_secret,
             _paddle_price_id_for_tier(PricingTier.standard),
             _paddle_price_id_for_tier(PricingTier.premium),
@@ -122,7 +124,8 @@ class PaymentService:
             # error telling them exactly which env vars are missing.
             raise RuntimeError(
                 "Payment not configured: set PADDLE_API_KEY, "
-                "PADDLE_WEBHOOK_SECRET, PADDLE_PRICE_STANDARD_ID and "
+                "PADDLE_CLIENT_TOKEN, PADDLE_WEBHOOK_SECRET, "
+                "PADDLE_PRICE_STANDARD_ID and "
                 "PADDLE_PRICE_PREMIUM_ID (or PAYMENT_MOCK_ENABLED=1 for local "
                 "dev). See server/payment.py for the full Paddle setup."
             )
@@ -265,7 +268,7 @@ def _paddle_api_base() -> str:
 
 def _create_paddle_checkout(payment_id: str, session_id: str,
                             tier: PricingTier) -> str:
-    """Create a Paddle transaction and return its hosted checkout URL.
+    """Create a Paddle transaction and return its approved payment-link URL.
 
     The order is bound to our internal payment record via ``custom_data`` so
     the webhook can route it back to the right session. Built with stdlib only
@@ -339,7 +342,7 @@ def _create_paddle_checkout(payment_id: str, session_id: str,
 
 
 def _extract_checkout_url(data: dict) -> str | None:
-    """Pull the hosted checkout URL out of a Paddle transaction response.
+    """Pull the approved checkout URL out of a Paddle transaction response.
 
     Primary path: ``data.checkout.url`` (Paddle Billing). Fallback: scan for a
     checkout.paddle.com URL anywhere in the JSON — defends against minor shape
@@ -356,11 +359,7 @@ def _extract_checkout_url(data: dict) -> str | None:
 
     if not candidates:
         text = json.dumps(data)
-        match = re.search(
-            r"https://[a-z0-9.-]*checkout\.paddle\.com/[^\s\"']+", text
-        )
-        if match:
-            candidates.append(match.group(0))
+        candidates.extend(re.findall(r"https://[^\s\"']+", text))
 
     for url in candidates:
         if _is_paddle_checkout_url(url):
@@ -369,14 +368,31 @@ def _extract_checkout_url(data: dict) -> str | None:
 
 
 def _is_paddle_checkout_url(url: str) -> bool:
-    """Return True if *url* is a valid Paddle hosted-checkout URL."""
-    if not url.startswith("https://"):
-        return False
+    """Accept Paddle-hosted links or our configured approved Paddle.js page."""
     try:
-        host = url.split("/", 3)[2].lower()
-    except IndexError:
+        parsed = urllib.parse.urlparse(url)
+    except ValueError:
         return False
-    return host in ("checkout.paddle.com", "sandbox-checkout.paddle.com")
+    if parsed.scheme != "https" or not parsed.hostname:
+        return False
+    host = parsed.hostname.lower()
+    if host in {
+        "checkout.paddle.com",
+        "sandbox-checkout.paddle.com",
+        "pay.paddle.io",
+        "sandbox.pay.paddle.io",
+    }:
+        return True
+
+    expected = urllib.parse.urlparse(settings.paddle_return_url)
+    query = urllib.parse.parse_qs(parsed.query)
+    transaction_ids = query.get("_ptxn", [])
+    return (
+        expected.scheme == "https"
+        and host == (expected.hostname or "").lower()
+        and parsed.path.rstrip("/") == expected.path.rstrip("/")
+        and any(value.startswith("txn_") for value in transaction_ids)
+    )
 
 
 def check_tier_permission(session, feature: str) -> bool:

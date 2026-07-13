@@ -188,6 +188,8 @@ class _RejectedWorker:
         self.output_path.write_bytes(b"not-delivered")
         return str(self.output_path), _metadata(deliverable=False, hard_gates_pass=False)
 
+    execute_hero_preview = execute_generate_with_quality_pipeline
+
 
 class _DuplicateWorker:
     def __init__(self, output_path: Path):
@@ -338,6 +340,44 @@ async def test_non_deliverable_generation_is_not_saved_to_gallery(tmp_path):
     ]
     assert metadata["candidates"][0]["path"] == "cand_1.png"
     assert metadata["provider_invocations"][0]["operation"] == "CREATE_FROM_REFERENCES"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("job_type", [JobType.hero_preview, JobType.full_set])
+async def test_all_generation_products_reject_non_deliverable_images(tmp_path, job_type):
+    q = JobQueue()
+    q._worker = _RejectedWorker(tmp_path / f"{job_type.value}_worker_output.png")
+
+    state = SessionState(f"s_{job_type.value}", StyleKey.business, "female", "tok")
+    state.upload_dir = tmp_path / f"{job_type.value}_uploads"
+    state.output_dir = tmp_path / f"{job_type.value}_outputs"
+    state.upload_dir.mkdir()
+    state.output_dir.mkdir()
+    for idx in range(4):
+        photo = state.upload_dir / f"selfie{idx}.jpg"
+        photo.write_bytes(b"jpg")
+        state.uploaded_photos.append(photo)
+    state.status = SessionStatus.generating
+    q._sessions[state.session_id] = state
+
+    job = Job(
+        session_id=state.session_id,
+        job_type=job_type,
+        prompt="Generate a portrait.",
+        prompt_id="business_closeup",
+        shot_spec={"shot_id": "closeup"},
+    )
+    q._jobs[job.job_id] = job
+
+    await q._execute_job(job)
+
+    assert job.status == JobStatus.failed
+    assert "No deliverable portrait passed final QA" in job.error
+    assert state.generated_images == []
+    assert state.hero_preview_generated is False
+    assert state.hero_preview_image_id is None
+    assert list(state.output_dir.glob("img_*.png")) == []
+    assert state.pipeline_metrics["generation_failures"] == 1
 
 
 @pytest.mark.asyncio
