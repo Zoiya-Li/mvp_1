@@ -85,3 +85,29 @@ def test_copy_with_ai_metadata_applies_visible_label_on_delivered_png(tmp_path):
         before_bytes = before.convert("RGBA").crop(label_region).tobytes()
         after_bytes = after.convert("RGBA").crop(label_region).tobytes()
         assert before_bytes != after_bytes
+
+
+def test_clean_export_keeps_ai_metadata_without_changing_pixels(tmp_path):
+    Image = pytest.importorskip("PIL.Image")
+
+    src = tmp_path / "src.png"
+    dest = tmp_path / "clean.png"
+    Image.new("RGB", (240, 160), color=(32, 64, 96)).save(src, format="PNG")
+
+    result = copy_with_ai_metadata(
+        src,
+        dest,
+        operation="GENERATE",
+        visible_label=False,
+    )
+
+    meta = read_ai_metadata(dest)
+    assert result["metadata_ai_label"] is True
+    assert result["visible_ai_label"] is False
+    assert result["visible_label_reserved"] is False
+    assert result["clean_export"] is True
+    assert meta[AI_LABEL_KEY] == AI_LABEL_VALUE
+    assert meta["FlashShotCleanExport"] == "true"
+    assert meta["FlashShotVisibleLabelApplied"] == "false"
+    with Image.open(src) as before, Image.open(dest) as after:
+        assert before.convert("RGBA").tobytes() == after.convert("RGBA").tobytes()

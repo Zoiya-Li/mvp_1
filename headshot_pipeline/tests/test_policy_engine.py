@@ -14,7 +14,7 @@ from __future__ import annotations
 import pytest
 
 from server.evaluation.agent_router import AgentRouter
-from server.evaluation.policy_engine import PolicyEngine
+from server.evaluation.policy_engine import PolicyEngine, select_best_variant
 
 
 @pytest.fixture
@@ -33,6 +33,7 @@ def sample_judgement():
         "scores": {
             "identity": 8.5,
             "style_match": 8.0,
+            "realism": 9.0,
             "artifact": 9.0,
             "aesthetic": 8.5,
         },
@@ -139,6 +140,28 @@ class TestPolicyEngineDecide:
             budget=healthy_budget,
         )
         assert decision["action"] == "REGENERATE_FROM_ORIGINAL"
+
+    def test_low_identity_good_frame_prefers_local_identity_repair(
+        self, policy, healthy_budget
+    ):
+        judgement = {
+            "scores": {
+                "identity": 5.0,
+                "face_quality": 9.0,
+                "style_match": 10.0,
+                "artifact": 9.0,
+                "commercial_readiness": 9.0,
+            },
+            "hard_failures": ["identity_too_low"],
+            "recommended_action": "face_swap",
+        }
+
+        decision = policy.decide(
+            judgement=judgement,
+            budget=healthy_budget,
+        )
+
+        assert decision["action"] == "IDENTITY_REPAIR"
 
     def test_shot_risk_high_risk(self, policy, sample_judgement, healthy_budget):
         """High-risk shots should lower ACCEPT confidence."""
@@ -323,6 +346,52 @@ class TestPolicyEngineBackwardCompat:
         assert policy.should_apply_identity_repair(judgement) is True
 
 
+class TestPolicyEngineStrategyEvidence:
+    def test_uses_only_active_cross_episode_strategy_evidence(
+        self, router, sample_judgement, healthy_budget
+    ):
+        class StubLearning:
+            def __init__(self):
+                self.calls = []
+
+            def strategy_adjustment(self, **kwargs):
+                self.calls.append(kwargs)
+                return {
+                    "active": kwargs["action"] == "ACCEPT",
+                    "multiplier": 1.05 if kwargs["action"] == "ACCEPT" else 1.0,
+                    "samples": 25,
+                }
+
+        learning = StubLearning()
+        policy = PolicyEngine(agent_router=router, learning_layer=learning)
+
+        decision = policy.decide(
+            judgement=sample_judgement,
+            budget=healthy_budget,
+            shot_spec={"shot_type": "closeup"},
+        )
+
+        assert decision["policy_evidence"]["ACCEPT"]["samples"] == 25
+        assert {call["shot_profile"] for call in learning.calls} == {"closeup"}
+
+    def test_learning_store_failure_falls_back_to_static_policy(
+        self, router, sample_judgement, healthy_budget
+    ):
+        class BrokenLearning:
+            def strategy_adjustment(self, **_kwargs):
+                raise RuntimeError("database locked")
+
+        policy = PolicyEngine(agent_router=router, learning_layer=BrokenLearning())
+
+        decision = policy.decide(
+            judgement=sample_judgement,
+            budget=healthy_budget,
+        )
+
+        assert decision["action"] == "ACCEPT"
+        assert decision["policy_evidence"] == {}
+
+
 class TestPolicyEngineEdgeCases:
     """Test edge cases and boundary conditions."""
 
@@ -367,7 +436,7 @@ class TestPolicyEngineEdgeCases:
 
     def test_high_risk_shot_with_good_identity(self, policy, healthy_budget):
         judgement = {
-            "scores": {"identity": 9.5, "style_match": 8.0, "artifact": 9.0},
+            "scores": {"identity": 9.5, "style_match": 8.0, "realism": 9.0, "artifact": 9.0},
             "hard_failures": [],
             "recommended_action": "accept",
         }
@@ -387,6 +456,7 @@ class TestPolicyEngineEdgeCases:
             "scores": {
                 "identity": 9.0,
                 "face_quality": 7.0,
+                "realism": 9.0,
                 "artifact": 9.0,
                 "commercial_readiness": 9.0,
                 "style_match": 9.0,
@@ -397,16 +467,120 @@ class TestPolicyEngineEdgeCases:
 
         decision = policy.decide(judgement=judgement, budget=healthy_budget)
 
-        assert decision["base_action"] == "DROP_CANDIDATE"
+        assert decision["base_action"] == "REGENERATE_FROM_ORIGINAL"
         assert decision["action"] != "ACCEPT"
         assert "ACCEPT" not in decision["eligible_actions"]
 
-    def test_unimplemented_pose_reference_action_is_never_eligible(
-        self, policy, sample_judgement, healthy_budget
+    def test_pose_geometry_failure_routes_to_pose_reference(
+        self, policy, healthy_budget
     ):
+        judgement = {
+            "scores": {
+                "identity": 8.5,
+                "face_quality": 9.0,
+                "style_match": 9.0,
+                "realism": 9.0,
+                "artifact": 9.0,
+                "commercial_readiness": 9.0,
+            },
+            "hard_failures": ["identity_geometry_drift"],
+            "recommended_action": "retry",
+        }
         decision = policy.decide(
-            judgement=sample_judgement,
+            judgement=judgement,
             budget=healthy_budget,
+            shot_spec={"shot_id": "profile"},
         )
 
-        assert "REGENERATE_WITH_POSE_REFERENCE" not in decision["eligible_actions"]
+        assert decision["action"] == "REGENERATE_WITH_POSE_REFERENCE"
+        assert decision["failure_class"] == "identity_geometry"
+
+
+def _variant(
+    stage: str,
+    *,
+    realism: float | None,
+    aggregate: float = 8.0,
+    hard_gates_pass: bool = True,
+    with_judgement: bool = True,
+) -> dict:
+    """Build a minimal pipeline-variant record for selection tests."""
+    judgement = None
+    if with_judgement:
+        judgement = {
+            "scores": {"identity": 9, "realism": realism},
+            "hard_failures": [],
+            "recommended_action": "accept",
+        }
+    return {
+        "stage": stage,
+        "filename": f"{stage}.png",
+        "judgement": judgement,
+        "aggregate_score": aggregate,
+        "gate_status": {"hard_gates_pass": hard_gates_pass},
+    }
+
+
+class TestSelectBestVariant:
+    """Cross-stage variant selection: most real AND hard-gate-passing wins."""
+
+    def test_prefers_higher_realism_earlier_stage(self):
+        variants = [
+            _variant("composition_identity_blend", realism=8, aggregate=8.5),
+            _variant("local_edit", realism=6, aggregate=8.8),
+            _variant("identity_repair", realism=5, aggregate=8.9),
+        ]
+        best = select_best_variant(variants)
+        assert best is variants[0]
+
+    def test_realism_missing_counts_as_minus_one(self):
+        variants = [
+            _variant("generated", realism=None, aggregate=9.5),
+            _variant("local_edit", realism=8, aggregate=8.0),
+        ]
+        best = select_best_variant(variants)
+        assert best is variants[1]
+
+    def test_aggregate_breaks_realism_tie(self):
+        variants = [
+            _variant("generated", realism=8, aggregate=8.0),
+            _variant("local_edit", realism=8, aggregate=9.0),
+        ]
+        best = select_best_variant(variants)
+        assert best is variants[1]
+
+    def test_full_tie_keeps_later_stage(self):
+        variants = [
+            _variant("composition_face_swap", realism=9, aggregate=8.5),
+            _variant("composition_identity_blend", realism=9, aggregate=8.5),
+        ]
+        best = select_best_variant(variants)
+        assert best is variants[1]
+
+    def test_skips_variants_failing_hard_gates(self):
+        variants = [
+            _variant("generated", realism=10, hard_gates_pass=False),
+            _variant("local_edit", realism=8),
+        ]
+        best = select_best_variant(variants)
+        assert best is variants[1]
+
+    def test_skips_variants_without_judgement(self):
+        variants = [
+            _variant("composition_scaffold", realism=None, with_judgement=False),
+            _variant("composition_face_swap", realism=8),
+        ]
+        best = select_best_variant(variants)
+        assert best is variants[1]
+
+    def test_returns_none_when_no_variant_passes(self):
+        variants = [
+            _variant("generated", realism=10, hard_gates_pass=False),
+            _variant("local_edit", realism=9, hard_gates_pass=False),
+            _variant("composition_scaffold", realism=None, with_judgement=False),
+        ]
+        assert select_best_variant(variants) is None
+
+    def test_returns_none_for_empty_or_missing_variants(self):
+        assert select_best_variant([]) is None
+        assert select_best_variant(None) is None

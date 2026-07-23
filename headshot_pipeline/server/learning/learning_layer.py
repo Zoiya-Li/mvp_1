@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import sqlite3
 import threading
+import math
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -114,6 +115,25 @@ class LearningLayer:
                     sample_count_at_time  INTEGER NOT NULL,
                     created_at            TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS pipeline_outcomes (
+                    outcome_id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                    failure_class         TEXT NOT NULL,
+                    action                TEXT NOT NULL,
+                    strategy              TEXT NOT NULL,
+                    route_mode            TEXT NOT NULL,
+                    model                 TEXT,
+                    shot_profile          TEXT NOT NULL,
+                    passed                INTEGER NOT NULL,
+                    identity_score        REAL,
+                    quality_score         REAL,
+                    cost                  REAL,
+                    created_at            TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_pipeline_outcome_context
+                    ON pipeline_outcomes(failure_class, shot_profile, action);
+                CREATE INDEX IF NOT EXISTS idx_pipeline_outcome_strategy
+                    ON pipeline_outcomes(strategy, route_mode, model);
                 """
             )
             columns = {
@@ -400,3 +420,151 @@ class LearningLayer:
             }
             for r in rows
         ]
+
+    # ── Recovery-strategy memory ──────────────────────────────
+
+    def record_pipeline_outcome(
+        self,
+        *,
+        failure_class: str,
+        action: str,
+        strategy: str,
+        route_mode: str,
+        shot_profile: str,
+        passed: bool,
+        model: str | None = None,
+        identity_score: float | None = None,
+        quality_score: float | None = None,
+        cost: float | None = None,
+    ) -> None:
+        """Persist one action outcome without storing image data or identity."""
+        with self._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO pipeline_outcomes
+                (failure_class, action, strategy, route_mode, model,
+                 shot_profile, passed, identity_score, quality_score, cost,
+                 created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    failure_class or "unknown_quality",
+                    action,
+                    strategy,
+                    route_mode or "primary",
+                    model,
+                    shot_profile or "default",
+                    int(bool(passed)),
+                    identity_score,
+                    quality_score,
+                    cost,
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+
+    def strategy_stats(
+        self,
+        *,
+        failure_class: str | None = None,
+        shot_profile: str | None = None,
+    ) -> list[dict]:
+        """Return auditable pass/cost statistics for recovery strategies."""
+        where = []
+        params: list[str] = []
+        if failure_class:
+            where.append("failure_class = ?")
+            params.append(failure_class)
+        if shot_profile:
+            where.append("shot_profile = ?")
+            params.append(shot_profile)
+        sql = """
+            SELECT failure_class, action, strategy, route_mode, model,
+                   shot_profile, COUNT(*) AS samples, SUM(passed) AS passes,
+                   AVG(identity_score) AS mean_identity_score,
+                   AVG(quality_score) AS mean_quality_score,
+                   AVG(cost) AS mean_cost
+            FROM pipeline_outcomes
+        """
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += """
+            GROUP BY failure_class, action, strategy, route_mode, model,
+                     shot_profile
+            ORDER BY samples DESC, passes DESC
+        """
+        with self._conn() as conn:
+            rows = conn.execute(sql, tuple(params)).fetchall()
+        results = []
+        for row in rows:
+            samples = int(row["samples"] or 0)
+            passes = int(row["passes"] or 0)
+            results.append({
+                "failure_class": row["failure_class"],
+                "action": row["action"],
+                "strategy": row["strategy"],
+                "route_mode": row["route_mode"],
+                "model": row["model"],
+                "shot_profile": row["shot_profile"],
+                "samples": samples,
+                "passes": passes,
+                "pass_rate": round(passes / samples, 4) if samples else None,
+                "wilson_lower_bound": round(
+                    self._wilson_lower_bound(passes, samples), 4
+                ),
+                "mean_identity_score": row["mean_identity_score"],
+                "mean_quality_score": row["mean_quality_score"],
+                "mean_cost": row["mean_cost"],
+            })
+        return results
+
+    def strategy_adjustment(
+        self,
+        *,
+        failure_class: str,
+        action: str,
+        shot_profile: str,
+        minimum_samples: int = 20,
+    ) -> dict:
+        """Return a bounded policy multiplier only after enough evidence."""
+        matching = [
+            row for row in self.strategy_stats(
+                failure_class=failure_class,
+                shot_profile=shot_profile,
+            )
+            if row["action"] == action
+        ]
+        samples = sum(int(row["samples"]) for row in matching)
+        passes = sum(int(row["passes"]) for row in matching)
+        if samples < minimum_samples:
+            return {
+                "active": False,
+                "samples": samples,
+                "passes": passes,
+                "multiplier": 1.0,
+                "reason": "insufficient_strategy_evidence",
+            }
+        lower_bound = self._wilson_lower_bound(passes, samples)
+        # A conservative 15% maximum movement keeps learned evidence below hard
+        # gates and the episode ladder in authority.
+        multiplier = max(0.85, min(1.15, 0.85 + 0.30 * lower_bound))
+        return {
+            "active": True,
+            "samples": samples,
+            "passes": passes,
+            "pass_rate": round(passes / samples, 4),
+            "wilson_lower_bound": round(lower_bound, 4),
+            "multiplier": round(multiplier, 4),
+            "reason": "evidence_weighted_strategy_prior",
+        }
+
+    @staticmethod
+    def _wilson_lower_bound(passes: int, samples: int, z: float = 1.96) -> float:
+        if samples <= 0:
+            return 0.0
+        proportion = passes / samples
+        denominator = 1 + z * z / samples
+        centre = proportion + z * z / (2 * samples)
+        margin = z * math.sqrt(
+            (proportion * (1 - proportion) + z * z / (4 * samples)) / samples
+        )
+        return max(0.0, (centre - margin) / denominator)

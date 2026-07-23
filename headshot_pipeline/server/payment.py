@@ -108,7 +108,29 @@ class PaymentService:
         ])
 
     @staticmethod
-    def create_order(session_id: str, tier: PricingTier) -> PaymentResponse:
+    def schedule_mock_confirmation(payment_id: str, delay: int = 5) -> bool:
+        """Schedule dev-only payment confirmation on the caller's event loop.
+
+        Gateway order creation runs in a worker thread in the HTTP routes. A
+        worker thread has no running asyncio loop, so the route calls this once
+        it returns to FastAPI's loop. Keeping the helper here also preserves
+        direct async development callers of ``create_order``.
+        """
+        if not PaymentService.is_mock():
+            return False
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return False
+        loop.create_task(_mock_auto_confirm(payment_id, delay=delay))
+        return True
+
+    @staticmethod
+    def create_order(
+        session_id: str,
+        tier: PricingTier,
+        return_params: dict[str, str] | None = None,
+    ) -> PaymentResponse:
         limits = TIER_LIMITS[tier]
         payment_id = f"pay_{uuid.uuid4().hex[:8]}"
 
@@ -117,7 +139,9 @@ class PaymentService:
             # Local dev only — auto-confirms (PAYMENT_MOCK_ENABLED=1).
             checkout_url = None
         elif PaymentService.is_paddle_configured():
-            checkout_url = _create_paddle_checkout(payment_id, session_id, tier)
+            checkout_url = _create_paddle_checkout(
+                payment_id, session_id, tier, return_params=return_params,
+            )
         else:
             # Neither mock nor Paddle configured — refuse to create an order
             # rather than silently handing out premium. The user gets a clear
@@ -145,14 +169,10 @@ class PaymentService:
             limits["price_cents"], record.created_at,
         )
 
-        # In mock mode only, auto-confirm after 5s (dev convenience).
-        if PaymentService.is_mock():
-            try:
-                loop = asyncio.get_running_loop()
-                loop.create_task(_mock_auto_confirm(payment_id, delay=5))
-            except RuntimeError:
-                # No running loop — caller is sync; skip auto-confirm.
-                pass
+        # Direct async callers can schedule immediately. HTTP routes create the
+        # order in a worker thread and schedule again after returning to their
+        # event loop; this call is therefore a no-op for those routes.
+        PaymentService.schedule_mock_confirmation(payment_id)
 
         return record
 
@@ -266,8 +286,12 @@ def _paddle_api_base() -> str:
     )
 
 
-def _create_paddle_checkout(payment_id: str, session_id: str,
-                            tier: PricingTier) -> str:
+def _create_paddle_checkout(
+    payment_id: str,
+    session_id: str,
+    tier: PricingTier,
+    return_params: dict[str, str] | None = None,
+) -> str:
     """Create a Paddle transaction and return its approved payment-link URL.
 
     The order is bound to our internal payment record via ``custom_data`` so
@@ -287,11 +311,18 @@ def _create_paddle_checkout(payment_id: str, session_id: str,
             f"No Paddle price_id configured for tier {tier.value}"
         )
 
+    return_url = settings.paddle_return_url
+    if return_params:
+        separator = "&" if urllib.parse.urlparse(return_url).query else "?"
+        return_url = return_url + separator + urllib.parse.urlencode({
+            **return_params,
+            "order": payment_id,
+        })
     body = json.dumps({
         "items": [{"price_id": price_id, "quantity": 1}],
         "currency_code": "USD",
         "custom_data": {"payment_id": payment_id, "session_id": session_id},
-        "checkout": {"url": settings.paddle_return_url},
+        "checkout": {"url": return_url},
     }).encode("utf-8")
 
     req = urllib.request.Request(

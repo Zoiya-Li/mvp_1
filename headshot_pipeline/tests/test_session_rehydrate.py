@@ -11,8 +11,10 @@ A "restart" is simulated by clearing the in-memory cache; no network / no Chrome
 
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
+from datetime import timedelta
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parents[2]
@@ -63,6 +65,7 @@ def tmp_env(tmp_path, monkeypatch):
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "img_aabbccdd.png").write_bytes(b"\x89PNG\r\n\x1a\n" + b"x" * 50)
     (out_dir / "pp_11223344.png").write_bytes(b"\x89PNG\r\n\x1a\n" + b"y" * 50)
+    (out_dir / "pp_00000000.png").write_bytes(b"\x89PNG\r\n\x1a\n" + b"z" * 50)
     # An intermediate post-process file that must NOT be re-listed as an image.
     (out_dir / "img_aabbccdd_crop_red.png").write_bytes(b"garbage")
 
@@ -88,7 +91,7 @@ def tmp_env(tmp_path, monkeypatch):
                 },
             },
         },
-        created_at=now,
+        created_at=now - timedelta(seconds=2),
     )
     storage.save_generated_image(
         image_id="pp_11223344", session_id=SID, prompt_id="upscale_x2", turn=1,
@@ -97,6 +100,19 @@ def tmp_env(tmp_path, monkeypatch):
         resemblance={
             "final_asset": {
                 "image_id": "pp_11223344",
+                "operation": "upscale_x2",
+                "metadata_ai_label": True,
+            }
+        },
+        created_at=now - timedelta(seconds=1),
+    )
+    storage.save_generated_image(
+        image_id="pp_00000000", session_id=SID, prompt_id="upscale_x2", turn=1,
+        revised_image_id=None, parent_image_id="img_aabbccdd",
+        operation="upscale_x2",
+        resemblance={
+            "final_asset": {
+                "image_id": "pp_00000000",
                 "operation": "upscale_x2",
                 "metadata_ai_label": True,
             }
@@ -236,9 +252,18 @@ def test_rehydrate_preserves_identity_pack_slot_order(tmp_env):
 
 def test_gallery_has_raw_and_pp_intermediate_excluded(tmp_env):
     state = _fresh_queue().get_session(SID)
-    assert len(state.generated_images) == 2
+    assert len(state.generated_images) == 3
     ids = {im.image_id for im in state.generated_images}
-    assert ids == {"img_aabbccdd", "pp_11223344"}
+    assert ids == {"img_aabbccdd", "pp_11223344", "pp_00000000"}
+
+
+def test_gallery_rehydrates_in_persisted_creation_order(tmp_env):
+    state = _fresh_queue().get_session(SID)
+    assert [image.image_id for image in state.generated_images] == [
+        "img_aabbccdd",
+        "pp_11223344",
+        "pp_00000000",
+    ]
 
 
 def test_raw_image_metadata_and_resemblance_recovered(tmp_env):
@@ -292,6 +317,70 @@ def test_generation_event_metrics_survive_restart(tmp_env):
         "delivery_gate_failed": 1
     }
     assert metrics["shot_metrics"]["half_body"]["failure_rate"] == 1
+
+
+def test_restart_recovers_hero_unlock_and_closes_interrupted_job(tmp_env):
+    now = storage.utcnow()
+    storage.update_session_hero_preview(SID, "img_aabbccdd", unlocked=True)
+    storage.update_session_status(SID, SessionStatus.generating.value)
+    storage.save_generation_event(
+        event_id="j_interrupted",
+        session_id=SID,
+        job_id="j_interrupted",
+        prompt_id="biz_male_03",
+        shot_spec={"shot_id": "seated"},
+        status="processing",
+        failure_reason=None,
+        error=None,
+        result_image_id=None,
+        created_at=now,
+        completed_at=None,
+    )
+
+    state = _fresh_queue().get_session(SID)
+
+    assert state.hero_preview_generated is True
+    assert state.hero_preview_image_id == "img_aabbccdd"
+    assert state.unlocked is True
+    assert state.status == SessionStatus.failed
+    interrupted = next(
+        row for row in storage.load_generation_events(SID)
+        if row["job_id"] == "j_interrupted"
+    )
+    assert interrupted["status"] == "failed"
+    assert interrupted["failure_reason"] == "worker_interrupted"
+    assert interrupted["completed_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_unlock_after_restart_queues_only_missing_shots(tmp_env):
+    now = storage.utcnow()
+    storage.update_session_hero_preview(SID, "img_aabbccdd", unlocked=True)
+    storage.save_generation_event(
+        event_id="j_half_body_done",
+        session_id=SID,
+        job_id="j_half_body_done",
+        prompt_id="biz_male_half_body",
+        shot_spec={"shot_id": "half_body"},
+        status="completed",
+        failure_reason=None,
+        error=None,
+        result_image_id="img_halfbody",
+        created_at=now,
+        completed_at=now,
+    )
+    queue = _fresh_queue()
+    queue._prompts_data = json.loads(
+        (_PIPELINE / "prompts.json").read_text(encoding="utf-8")
+    )
+    state = queue.get_session(SID)
+    assert state is not None
+
+    jobs = await queue.submit_unlock(SID)
+
+    shot_ids = {(job.shot_spec or {}).get("shot_id") for job in jobs}
+    assert "half_body" not in shot_ids
+    assert shot_ids == {"environmental", "seated", "profile", "candid"}
 
 
 def test_idempotent_rerehydrate(tmp_env):
@@ -374,6 +463,10 @@ async def test_delete_session_removes_disk_dirs_even_when_not_hydrated(tmp_env):
     output_dir.mkdir(parents=True)
     (upload_dir / "ref01_front.png").write_bytes(b"face")
     (output_dir / "img_deadbeef.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+    root_candidate = settings.output_dir / f"{sid}_hero_cand1_deadbeef.png"
+    root_candidate.write_bytes(b"private intermediate pixels")
+    other_candidate = settings.output_dir / "s_other_hero_cand1_keep.png"
+    other_candidate.write_bytes(b"other session")
     storage.save_generation_event(
         event_id="j_stale",
         session_id=sid,
@@ -395,6 +488,8 @@ async def test_delete_session_removes_disk_dirs_even_when_not_hydrated(tmp_env):
 
     assert not upload_dir.exists()
     assert not output_dir.exists()
+    assert not root_candidate.exists()
+    assert other_candidate.exists()
     assert storage.load_generation_events(sid) == []
     assert q.get_session(sid) is None
 

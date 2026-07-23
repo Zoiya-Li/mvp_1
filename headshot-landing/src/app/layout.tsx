@@ -1,15 +1,31 @@
 import type { Metadata } from "next";
+import { GeistSans } from "geist/font/sans";
+import { PwaRegistration } from "@/components/portrait/PwaRegistration";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "FlashShot — AI Portrait Studio · Artistic portraits that look like you",
+  applicationName: "FlashShot",
+  title: "FlashShot — Your private AI portrait studio",
   description:
-    "Upload a few selfies and generate multiple artistic portrait collections that look like you. Hanfu, Hong Kong style, French, Japanese, Korean, cinematic and more — get your own portrait collection without going to a photo studio.",
+    "Bring a portrait reference you love and step into a complete photo story that still looks unmistakably like you.",
   openGraph: {
-    title: "FlashShot — AI Portrait Studio · Artistic portraits that look like you",
+    title: "FlashShot — Your private AI portrait studio",
     description:
-      "Upload a few selfies and generate multiple artistic portrait collections that look like you. Hanfu, Hong Kong style, French, Japanese, Korean, cinematic and more — get your own portrait collection without going to a photo studio.",
+      "Bring a portrait reference you love and step into a complete photo story that still looks unmistakably like you.",
     type: "website",
+  },
+  manifest: "/manifest.webmanifest",
+  icons: {
+    icon: [
+      { url: "/flashshot-mark.svg", type: "image/svg+xml" },
+      { url: "/icons/flashshot-192.png", sizes: "192x192", type: "image/png" },
+    ],
+    apple: [{ url: "/icons/flashshot-180.png", sizes: "180x180", type: "image/png" }],
+  },
+  appleWebApp: {
+    capable: true,
+    statusBarStyle: "default",
+    title: "FlashShot",
   },
 };
 
@@ -19,9 +35,10 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="en">
-      <body className="bg-stone-50 text-stone-900 font-sans antialiased">
+    <html lang="en" className={GeistSans.variable}>
+      <body>
         {children}
+        <PwaRegistration />
       </body>
     </html>
   );

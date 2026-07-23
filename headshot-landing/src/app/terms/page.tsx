@@ -2,7 +2,7 @@ export default function TermsPage() {
   return (
     <main className="max-w-3xl mx-auto px-6 py-16">
       <h1 className="text-3xl font-semibold tracking-tight mb-8">Terms of Service</h1>
-      <p className="text-stone-500 text-sm mb-8">Last updated: July 1, 2026</p>
+      <p className="text-stone-500 text-sm mb-8">Last updated: July 14, 2026</p>
 
       <section className="space-y-6 text-stone-700 leading-relaxed">
         <div>
@@ -24,7 +24,7 @@ export default function TermsPage() {
           <ul className="list-disc pl-5 space-y-2">
             <li>You must be at least 18 years old to use the Service.</li>
             <li>You must have the legal right to use and upload the photos you provide.</li>
-            <li>You may only upload photos of yourself or photos for which you have explicit permission from the subject.</li>
+            <li>You may only upload photos of yourself. Private inspiration images must be images you have the right to use as style references.</li>
           </ul>
         </div>
 
@@ -33,7 +33,7 @@ export default function TermsPage() {
           <ul className="list-disc pl-5 space-y-2">
             <li><strong>Your photos:</strong> You retain all rights to the photos you upload.</li>
             <li><strong>Generated images:</strong> You are granted a personal, non-exclusive license to use the generated portraits for personal or commercial purposes.</li>
-            <li><strong>Prohibited content:</strong> You may not upload photos of minors without parental consent, photos containing nudity, violence, hate symbols, or any illegal content.</li>
+            <li><strong>Prohibited content:</strong> You may not upload photos of minors, non-consenting people, nudity, exploitative content, violence, hate symbols, or illegal content.</li>
           </ul>
         </div>
 
@@ -52,10 +52,10 @@ export default function TermsPage() {
         <div>
           <h2 className="text-xl font-semibold text-stone-900 mb-3">6. Payments and Refunds</h2>
           <ul className="list-disc pl-5 space-y-2">
-            <li>Payments are processed through Paddle. By making a purchase, you agree to Paddle&rsquo;s terms.</li>
-            <li>Due to the nature of AI generation (consumable compute resources), <strong>all sales are final</strong> once generation has begun.</li>
-            <li>If the Service fails to generate any portraits due to a technical error on our side, you may request a refund within 7 days.</li>
-            <li>Refunds are not available for dissatisfaction with style or artistic interpretation.</li>
+            <li>Purchases made in the iOS app are processed by Apple as in-app purchases and are subject to Apple&rsquo;s applicable media services terms. Website purchases, when available, are processed by Paddle.</li>
+            <li>Prices, taxes, and the applicable payment provider are shown before payment. Statutory consumer rights are not waived.</li>
+            <li>If the Service fails to deliver the purchased portrait set because of a technical error on our side, contact support within 7 days for remediation or refund review.</li>
+            <li>Refund and chargeback handling is subject to the purchasing platform&rsquo;s rules and applicable law.</li>
           </ul>
         </div>
 
@@ -63,7 +63,7 @@ export default function TermsPage() {
           <h2 className="text-xl font-semibold text-stone-900 mb-3">7. Intellectual Property</h2>
           <ul className="list-disc pl-5 space-y-2">
             <li>FlashShot retains all rights to the Service, its code, branding, and technology.</li>
-            <li>We reserve the right to use anonymized generated portraits for service improvement and marketing, unless you opt out.</li>
+            <li>Your portraits remain private unless you explicitly create a public share link. We do not use private portraits for marketing or model training without a separate opt-in.</li>
             <li>You may not claim that AI-generated portraits were created by human photographers without disclosure.</li>
           </ul>
         </div>
@@ -83,16 +83,9 @@ export default function TermsPage() {
         </div>
 
         <div>
-          <h2 className="text-xl font-semibold text-stone-900 mb-3">10. Governing Law</h2>
+          <h2 className="text-xl font-semibold text-stone-900 mb-3">10. Contact</h2>
           <p>
-            These Terms shall be governed by and construed in accordance with the laws of the State of Delaware, United States, without regard to its conflict of law provisions.
-          </p>
-        </div>
-
-        <div>
-          <h2 className="text-xl font-semibold text-stone-900 mb-3">11. Contact</h2>
-          <p>
-            For questions about these Terms, contact us at <a href="mailto:legal@flashshot.ai" className="text-accent underline">legal@flashshot.ai</a>.
+            For questions about these Terms, contact us at <a href="mailto:support@flashshot.top" className="text-accent underline">support@flashshot.top</a>.
           </p>
         </div>
       </section>

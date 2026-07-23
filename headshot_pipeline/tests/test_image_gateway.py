@@ -23,8 +23,8 @@ from server.config import settings  # noqa: E402
 
 def test_gateway_estimates_reference_heavy_generation_cost(monkeypatch):
     monkeypatch.setattr(settings, "gemini_backend", "openrouter")
-    assert estimate_cost("CREATE_FROM_REFERENCES", reference_count=1) == 0.12
-    assert estimate_cost("CREATE_FROM_REFERENCES", reference_count=4) == 0.1488
+    assert estimate_cost("CREATE_FROM_REFERENCES", reference_count=1) == 0.04
+    assert estimate_cost("CREATE_FROM_REFERENCES", reference_count=4) == 0.0496
     assert estimate_cost("IDENTITY_REPAIR", reference_count=4) == 0.0
     assert estimate_cost("UPSCALE", reference_count=0) == 0.0
     assert estimate_cost("FINAL_RENDER", reference_count=0) == 0.0
@@ -35,7 +35,9 @@ def test_gateway_exposes_provider_capabilities(monkeypatch):
     cap = provider_for_operation("CREATE_FROM_REFERENCES")
     assert cap.provider == "openrouter"
     assert cap.supports_multiple_references is True
-    assert cap.max_reference_images == 4
+    assert cap.max_reference_images == 5
+    assert cap.model == "bytedance-seed/seedream-4.5"
+    assert cap.supports_seed is True
 
     meta = invocation_provider_metadata("LOCAL_EDIT")
     assert meta["provider"] == "openrouter"

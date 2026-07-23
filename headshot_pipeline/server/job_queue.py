@@ -26,18 +26,20 @@ from fastapi import WebSocket
 
 from . import storage
 from .config import settings
-from .delivery_label import copy_with_ai_metadata
+from .delivery_label import clean_export_path, copy_with_ai_metadata
 from .delivery_policy import (
     find_registered_image,
     image_passed_final_gate,
     image_or_source_passed_final_gate,
 )
 from .gemini_worker import GeminiWorker
-from .evaluation import EvaluationService
+from .evaluation import EvaluationService, classify_selected_failure
 from .image_gateway import build_provider_invocation_metadata
 from .input_quality import (
+    assess_reference_diversity,
     assess_reference_identity_consistency,
     assess_reference_photo,
+    order_reference_paths_by_pose,
     summarize_reference_set,
 )
 from .learning import LearningLayer
@@ -57,14 +59,52 @@ from .models import (
 )
 from .payment import PaymentService
 from .security import generate_token, safe_id
-from .shot_planner import build_style_shot_plan
+from .shot_planner import (
+    build_recovery_shot_spec,
+    build_style_shot_plan,
+    compose_recovery_shot_prompt,
+)
 
 
 DEFAULT_DELIVERY_GATE_ERROR = (
-    "No deliverable portrait passed final QA; please upload clearer references "
-    "or try another style."
+    "没有写真通过最终质量检查；请上传更清晰的参考照片，或尝试其他主题。"
 )
 FINAL_DUPLICATE_HAMMING_THRESHOLD = 4
+MAX_AUTOMATIC_FULL_SET_RETRIES = 1
+
+_TRANSIENT_GENERATION_ERROR_MARKERS = (
+    "http 429",
+    "http 500",
+    "http 502",
+    "http 503",
+    "http 504",
+    "api error 429",
+    "api error 500",
+    "api error 502",
+    "api error 503",
+    "api error 504",
+    "request failed",
+    "transport error",
+    "timed out",
+    "timeout",
+    "could not download generated image",
+)
+
+_PERMANENT_PROVIDER_ERROR_MARKERS = (
+    "account balance is insufficient",
+    "insufficient balance",
+    "insufficient credit",
+    "http 400",
+    "http 401",
+    "http 402",
+    "http 403",
+    "api error 400",
+    "api error 401",
+    "api error 402",
+    "api error 403",
+    "api key is not set",
+    "api_key is not set",
+)
 
 REVISION_DENY_KEYWORDS = (
     "regenerate",
@@ -212,7 +252,19 @@ def _record_generation_failure(session: SessionState, reason: str) -> None:
     reasons[reason] = int(reasons.get(reason, 0) or 0) + 1
 
 
+def _is_transient_generation_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return any(marker in message for marker in _TRANSIENT_GENERATION_ERROR_MARKERS)
+
+
+def _is_permanent_provider_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return any(marker in message for marker in _PERMANENT_PROVIDER_ERROR_MARKERS)
+
+
 def _ensure_failed_generation_metric_defaults(metrics: dict) -> None:
+    metrics.setdefault("automatic_full_set_retries", 0)
+    metrics.setdefault("automatic_full_set_retry_successes", 0)
     metrics.setdefault("failed_provider_invocations", 0)
     metrics.setdefault("failed_create_from_reference_invocations", 0)
     metrics.setdefault("failed_operation_counts", {})
@@ -472,6 +524,11 @@ def _generation_metrics_from_event_rows(rows: list[Any]) -> dict:
         shot_id = _shot_id_from_spec(_shot_spec_from_event_row(row))
         shot_item = _shot_metric_item(metrics, shot_id)
         metadata = _event_metadata_from_row(row)
+        automatic_retry = metadata.get("automatic_retry") or {}
+        if isinstance(automatic_retry, dict) and automatic_retry.get("count"):
+            metrics["automatic_full_set_retries"] += 1
+            if status == JobStatus.completed.value:
+                metrics["automatic_full_set_retry_successes"] += 1
         metrics["generation_attempts"] += 1
         shot_item["attempts"] += 1
         if status == JobStatus.completed.value:
@@ -509,13 +566,19 @@ def _save_generation_event(
     metadata: dict | None = None,
 ) -> None:
     try:
+        event_metadata = _sanitize_generation_metadata(metadata) or {}
+        if job.automatic_retry_count:
+            event_metadata["automatic_retry"] = {
+                "count": job.automatic_retry_count,
+                "reason": job.automatic_retry_reason,
+            }
         storage.save_generation_event(
             event_id=job.job_id,
             session_id=job.session_id,
             job_id=job.job_id,
             prompt_id=job.prompt_id,
             shot_spec=job.shot_spec,
-            metadata=_sanitize_generation_metadata(metadata),
+            metadata=event_metadata,
             status=status.value,
             failure_reason=failure_reason,
             error=error,
@@ -562,6 +625,36 @@ def _session_media_dirs(
         if path not in dirs:
             dirs.append(path)
     return dirs
+
+
+def _delete_session_intermediate_outputs(session_id: str) -> int:
+    """Remove provider artifacts written beside per-session output folders.
+
+    Providers save candidate stages in the global output root before the queue
+    copies the accepted image into ``output/<session_id>/``. Candidate titles
+    always begin with the validated session id, so an exact ``<id>_`` prefix
+    lets us remove only this job's undelivered pixels.
+    """
+    try:
+        safe_session_id = safe_id(session_id, label="session_id")
+    except Exception:
+        return 0
+    root = settings.output_dir
+    if root is None or not root.exists():
+        return 0
+    prefix = f"{safe_session_id}_"
+    removed = 0
+    for path in root.iterdir():
+        if not path.name.startswith(prefix):
+            continue
+        try:
+            if path.parent.resolve() != root.resolve() or not path.is_file():
+                continue
+            path.unlink(missing_ok=True)
+            removed += 1
+        except OSError:
+            continue
+    return removed
 
 
 def _selected_candidate(metadata: dict | None) -> dict:
@@ -638,13 +731,21 @@ def delivery_gate_failure_message(metadata: dict | None) -> str:
     return f"{DEFAULT_DELIVERY_GATE_ERROR} Final gate: {', '.join(reasons)}."
 
 
-def build_ai_label_check(ai_label: dict[str, Any]) -> dict:
+def build_ai_label_check(
+    ai_label: dict[str, Any],
+    clean_ai_label: dict[str, Any] | None = None,
+) -> dict:
     """Return final-evaluate metadata for the generated-content label step."""
     issues: list[str] = []
     if not ai_label.get("metadata_ai_label"):
         issues.append("missing_png_ai_metadata")
     if not ai_label.get("visible_label_reserved"):
         issues.append("visible_label_not_reserved")
+    if clean_ai_label is not None:
+        if not clean_ai_label.get("metadata_ai_label"):
+            issues.append("clean_export_missing_png_ai_metadata")
+        if clean_ai_label.get("visible_ai_label"):
+            issues.append("clean_export_has_visible_label")
     passed = not issues
     return {
         "pass": passed,
@@ -652,6 +753,11 @@ def build_ai_label_check(ai_label: dict[str, Any]) -> dict:
         "metadata_ai_label": bool(ai_label.get("metadata_ai_label")),
         "visible_ai_label": bool(ai_label.get("visible_ai_label")),
         "visible_label_reserved": bool(ai_label.get("visible_label_reserved")),
+        "clean_export_ready": bool(
+            clean_ai_label
+            and clean_ai_label.get("metadata_ai_label")
+            and not clean_ai_label.get("visible_ai_label")
+        ),
         "issues": issues,
     }
 
@@ -786,6 +892,8 @@ class JobQueue:
         self._worker_task: asyncio.Task | None = None
         self._worker: GeminiWorker | None = None
         self._worker_readiness_error: str | None = None
+        self._provider_readiness_checked_at: float = 0.0
+        self._provider_readiness_lock = asyncio.Lock()
         self._prompts_data: dict | None = None
         self._learning_layer: LearningLayer | None = None
         # Per-session locks, created on demand. Guards submit/upload mutations.
@@ -809,6 +917,58 @@ class JobQueue:
     @property
     def worker_readiness_error(self) -> str | None:
         return self._worker_readiness_error
+
+    def _mark_provider_unavailable(self, error: Exception) -> None:
+        """Fail closed after a permanent provider account/configuration error."""
+        self._worker_readiness_error = str(error)
+        self._provider_readiness_checked_at = time.monotonic()
+        if self._worker is None:
+            return
+        previous = self._worker.provider_readiness or {}
+        self._worker.provider_readiness = {
+            "pass": False,
+            "provider": previous.get("provider", settings.gemini_backend),
+            "model": previous.get("model"),
+            "error": "provider_account_or_configuration_error",
+        }
+
+    async def refresh_provider_readiness(
+        self,
+        *,
+        max_age_seconds: float = 30.0,
+    ) -> bool:
+        """Refresh model access and credits without requiring a process restart."""
+        now = time.monotonic()
+        if (
+            max_age_seconds > 0
+            and self._provider_readiness_checked_at > 0
+            and now - self._provider_readiness_checked_at < max_age_seconds
+        ):
+            return self.generation_ready
+        async with self._provider_readiness_lock:
+            if self._worker is None:
+                try:
+                    self._worker = GeminiWorker(learning_layer=self._learning_layer)
+                except Exception as exc:
+                    self._worker_readiness_error = str(exc)
+                    self._provider_readiness_checked_at = time.monotonic()
+                    self._worker = None
+                    return False
+            now = time.monotonic()
+            if (
+                max_age_seconds > 0
+                and self._provider_readiness_checked_at > 0
+                and now - self._provider_readiness_checked_at < max_age_seconds
+            ):
+                return self.generation_ready
+            try:
+                await asyncio.to_thread(self._worker.connect)
+                self._worker_readiness_error = None
+            except Exception as exc:
+                self._mark_provider_unavailable(exc)
+            finally:
+                self._provider_readiness_checked_at = time.monotonic()
+        return self.generation_ready
 
     # Raw generated images use img_{8hex}; post-processed variants use
     # pp_{8hex}. Intermediates ({stem}_crop_* etc.) are deleted after copy, so
@@ -840,6 +1000,7 @@ class JobQueue:
             self._worker = GeminiWorker(learning_layer=self._learning_layer)
             await asyncio.to_thread(self._worker.connect)
             self._worker_readiness_error = None
+            self._provider_readiness_checked_at = time.monotonic()
             readiness = self._worker.provider_readiness or {}
             print(
                 "✓ Image provider ready: %s / %s"
@@ -937,6 +1098,15 @@ class JobQueue:
         state.tier = PricingTier(row["tier"])
         state.max_revisions = row["max_revisions"]
         state.payment_id = row["payment_id"]
+        state.hero_preview_image_id = (
+            row["hero_preview_image_id"]
+            if "hero_preview_image_id" in row.keys()
+            else None
+        )
+        state.hero_preview_generated = bool(state.hero_preview_image_id)
+        state.unlocked = bool(
+            row["unlocked"] if "unlocked" in row.keys() else False
+        )
         consent_json = row["consent_json"] if "consent_json" in row.keys() else None
         if consent_json:
             try:
@@ -964,39 +1134,44 @@ class JobQueue:
         # Image gallery: persisted metadata is the delivery evidence source, and
         # disk is only the pixel-existence check. Do not resurrect orphaned
         # output files into the gallery without final-QA provenance.
-        meta_by_id = {
-            r["image_id"]: r for r in storage.load_generated_images(session_id)
-        }
+        metadata_rows = storage.load_generated_images(session_id)
         if state.output_dir.exists():
-            for p in sorted(state.output_dir.iterdir()):
+            disk_by_id = {
+                p.stem: p
+                for p in state.output_dir.iterdir()
+                if self._IMG_FILE_RE.match(p.name)
+            }
+            for r in sorted(
+                metadata_rows,
+                key=lambda row: (row["created_at"], row["image_id"]),
+            ):
+                p = disk_by_id.get(r["image_id"])
+                if p is None:
+                    continue
                 if not self._IMG_FILE_RE.match(p.name):
                     continue
                 image_id = p.stem
-                r = meta_by_id.get(image_id)
-                if r is not None:
+                try:
+                    created = datetime.fromisoformat(r["created_at"])
+                except Exception:
+                    created = storage.utcnow()
+                resemblance = None
+                if r["resemblance_json"]:
                     try:
-                        created = datetime.fromisoformat(r["created_at"])
+                        resemblance = json.loads(r["resemblance_json"])
                     except Exception:
-                        created = storage.utcnow()
-                    resemblance = None
-                    if r["resemblance_json"]:
-                        try:
-                            resemblance = json.loads(r["resemblance_json"])
-                        except Exception:
-                            resemblance = None
-                    img = GeneratedImage(
-                        image_id=image_id,
-                        url=f"/api/sessions/{session_id}/images/{image_id}",
-                        prompt_id=r["prompt_id"] or "recovered",
-                        turn=r["turn"],
-                        revised_image_id=r["revised_image_id"],
-                        parent_image_id=r["parent_image_id"],
-                        operation=r["operation"],
-                        resemblance=resemblance,
-                        created_at=created,
-                    )
-                else:
-                    continue
+                        resemblance = None
+                img = GeneratedImage(
+                    image_id=image_id,
+                    url=f"/api/sessions/{session_id}/images/{image_id}",
+                    prompt_id=r["prompt_id"] or "recovered",
+                    turn=r["turn"],
+                    revised_image_id=r["revised_image_id"],
+                    parent_image_id=r["parent_image_id"],
+                    operation=r["operation"],
+                    resemblance=resemblance,
+                    created_at=created,
+                )
                 if not restored_image_passed_delivery_policy(state, img):
                     continue
                 state.generated_images.append(img)
@@ -1013,6 +1188,16 @@ class JobQueue:
             }
             for r in storage.load_user_feedback(session_id)
         ]
+        interrupted = storage.fail_interrupted_generation_events(
+            session_id,
+            completed_at=storage.utcnow(),
+        )
+        if interrupted and state.status in {
+            SessionStatus.generating,
+            SessionStatus.reviewing,
+        }:
+            state.status = SessionStatus.failed
+            storage.update_session_status(session_id, state.status.value)
         state.pipeline_metrics = _generation_metrics_from_event_rows(
             storage.load_generation_events(session_id)
         )
@@ -1059,6 +1244,43 @@ class JobQueue:
         )
         return record
 
+    def grant_verified_project_purchase(
+        self, session_id: str, order_id: str,
+        tier: PricingTier = PricingTier.standard,
+    ) -> None:
+        """Promote a v2 project after its provider transaction was verified.
+
+        The caller must persist and validate the provider transaction before
+        invoking this method. Keeping this method provider-neutral lets the
+        native StoreKit path and optional web checkout share one queue gate.
+        """
+        limits = TIER_LIMITS[tier]
+        session = self.get_session(session_id)
+        if session:
+            session.tier = tier
+            session.max_revisions = limits["max_revisions"]
+            session.payment_id = order_id
+            session.payment_status = PaymentStatus.paid
+        storage.update_session_tier(
+            session_id, tier.value, limits["max_revisions"], order_id,
+        )
+
+    def revoke_verified_project_purchase(
+        self, session_id: str, order_id: str,
+    ) -> None:
+        """Revoke an unused entitlement without interrupting delivered work."""
+        session = self.get_session(session_id)
+        if session and session.payment_id == order_id and not session.unlocked:
+            session.tier = PricingTier.free
+            session.max_revisions = TIER_LIMITS[PricingTier.free]["max_revisions"]
+            session.payment_status = PaymentStatus.refunded
+            storage.update_session_tier(
+                session_id,
+                PricingTier.free.value,
+                session.max_revisions,
+                order_id,
+            )
+
     def apply_payment_refund(
         self,
         payment_id: str | None = None,
@@ -1087,6 +1309,7 @@ class JobQueue:
             await asyncio.to_thread(
                 shutil.rmtree, media_dir, True  # ignore_errors
             )
+        await asyncio.to_thread(_delete_session_intermediate_outputs, session_id)
         if self._worker:
             self._worker.end_session(session_id)
         try:
@@ -1105,6 +1328,35 @@ class JobQueue:
             storage.delete_session_row(session_id)
         except Exception:
             pass
+
+    async def expire_session_sources(self, session_id: str) -> None:
+        """Delete identity references while retaining non-biometric metadata."""
+        async with self._lock_for(session_id):
+            state = self._sessions.get(session_id) or self._hydrate_session(session_id)
+            upload_dir = state.upload_dir if state else settings.upload_dir / session_id
+            await asyncio.to_thread(shutil.rmtree, upload_dir, True)
+            if state:
+                state.uploaded_photos = []
+                state.photo_quality = {}
+                state.reference_quality = None
+                state.status = SessionStatus.created
+            storage.update_session_status(session_id, SessionStatus.created.value)
+
+    async def expire_session_outputs(self, session_id: str) -> None:
+        """Delete generated pixels while retaining minimum audit metadata."""
+        async with self._lock_for(session_id):
+            state = self._sessions.get(session_id) or self._hydrate_session(session_id)
+            output_dir = state.output_dir if state else settings.output_dir / session_id
+            await asyncio.to_thread(shutil.rmtree, output_dir, True)
+            await asyncio.to_thread(
+                _delete_session_intermediate_outputs, session_id
+            )
+            if state:
+                state.generated_images = []
+                state.hero_preview_image_id = None
+                state.hero_preview_generated = False
+            storage.delete_session_images(session_id)
+            storage.update_session_hero_preview(session_id, None, unlocked=False)
 
     async def record_user_feedback(
         self,
@@ -1211,12 +1463,23 @@ class JobQueue:
             identity_consistency = await asyncio.to_thread(
                 assess_reference_identity_consistency, state.uploaded_photos
             )
+            diversity = await asyncio.to_thread(
+                assess_reference_diversity,
+                state.uploaded_photos,
+                settings.min_photos,
+            )
             state.reference_quality = summarize_reference_set(
                 state.photo_quality,
                 settings.min_photos,
                 identity_consistency,
+                diversity,
+                identity_consistency.get("pose_diversity"),
             )
             if state.reference_quality.get("pass"):
+                state.uploaded_photos = order_reference_paths_by_pose(
+                    state.uploaded_photos,
+                    identity_consistency.get("pose_diversity"),
+                )
                 state.status = SessionStatus.ready
             else:
                 state.status = SessionStatus.uploading
@@ -1230,11 +1493,22 @@ class JobQueue:
         identity_consistency = assess_reference_identity_consistency(
             state.uploaded_photos
         )
+        diversity = assess_reference_diversity(
+            state.uploaded_photos,
+            settings.min_photos,
+        )
         state.reference_quality = summarize_reference_set(
             state.photo_quality,
             settings.min_photos,
             identity_consistency,
+            diversity,
+            identity_consistency.get("pose_diversity"),
         )
+        if state.reference_quality.get("pass"):
+            state.uploaded_photos = order_reference_paths_by_pose(
+                state.uploaded_photos,
+                identity_consistency.get("pose_diversity"),
+            )
         return state.reference_quality
 
     def reference_quality_gate(self, state: SessionState) -> dict:
@@ -1266,7 +1540,17 @@ class JobQueue:
 
     # ── Job submission ────────────────────────────────
 
-    async def submit_hero_preview(self, session_id: str, style_override: str | None = None) -> list[Job]:
+    async def submit_hero_preview(
+        self,
+        session_id: str,
+        style_override: str | None = None,
+        *,
+        custom_template_path: str | None = None,
+        custom_prompt: str | None = None,
+        replaces_image_id: str | None = None,
+        template_id: str | None = None,
+        shot_overrides: list[dict] | None = None,
+    ) -> list[Job]:
         """Create a hero preview job: one close-up portrait for the Aha Moment.
 
         ``style_override`` lets multi-style bundles pick the first selected style
@@ -1292,6 +1576,8 @@ class JobQueue:
                 state.gender,
                 style_data,
                 hero_only=True,
+                template_id=template_id,
+                shot_overrides=shot_overrides,
             )
             if not plan:
                 state.status = (
@@ -1302,15 +1588,26 @@ class JobQueue:
                 return []
 
             state.status = SessionStatus.generating
+            storage.update_session_status(session_id, state.status.value)
             jobs = []
             shot = plan[0]
+            prompt = custom_prompt or shot.prompt
+            template_path = custom_template_path or self._resolve_template_path(shot.template)
+            shot_spec = dict(shot.shot_spec)
+            if custom_template_path:
+                shot_spec["style_id"] = "private_inspiration"
+                shot_spec["template_id"] = "private_user_reference"
+                shot_spec["template_label"] = "Private inspiration"
+                shot_spec["prompt_blocks"] = dict(shot_spec["prompt_blocks"])
+                shot_spec["prompt_blocks"]["style_block"] = custom_prompt or "private inspiration"
             job = Job(
                 session_id=session_id,
                 job_type=JobType.hero_preview,
-                prompt=shot.prompt,
+                prompt=prompt,
                 prompt_id=shot.prompt_id,
-                template_path=self._resolve_template_path(shot.template),
-                shot_spec=shot.shot_spec,
+                template_path=template_path,
+                shot_spec=shot_spec,
+                replaces_image_id=replaces_image_id,
             )
             self._jobs[job.job_id] = job
             await self._queue.put(job)
@@ -1325,7 +1622,60 @@ class JobQueue:
             jobs.append(job)
             return jobs
 
-    async def submit_unlock(self, session_id: str) -> list[Job]:
+    @staticmethod
+    def _restore_replaced_hero(session: SessionState, job: Job) -> bool:
+        """Keep the prior preview usable when its requested replacement fails."""
+        image_id = job.replaces_image_id
+        if job.job_type != JobType.hero_preview or not image_id:
+            return False
+        original = next(
+            (image for image in session.generated_images if image.image_id == image_id),
+            None,
+        )
+        if original is None:
+            return False
+        original.operation = None
+        session.hero_preview_image_id = image_id
+        session.hero_preview_generated = True
+        session.status = SessionStatus.hero_preview_ready
+        storage.update_session_hero_preview(
+            session.session_id, image_id, unlocked=session.unlocked,
+        )
+        storage.update_session_status(
+            session.session_id, session.status.value,
+        )
+        storage.mark_generated_image_operation(
+            session.session_id, image_id, None,
+        )
+        return True
+
+    @staticmethod
+    def _supersede_replaced_hero(session: SessionState, job: Job) -> bool:
+        """Hide the prior preview from delivery after its replacement is durable."""
+        image_id = job.replaces_image_id
+        if job.job_type != JobType.hero_preview or not image_id:
+            return False
+        original = next(
+            (image for image in session.generated_images if image.image_id == image_id),
+            None,
+        )
+        if original is None:
+            return False
+        original.operation = "superseded_preview"
+        storage.mark_generated_image_operation(
+            session.session_id, image_id, "superseded_preview",
+        )
+        return True
+
+    async def submit_unlock(
+        self,
+        session_id: str,
+        *,
+        custom_template_path: str | None = None,
+        custom_style_prompt: str | None = None,
+        template_id: str | None = None,
+        shot_overrides: list[dict] | None = None,
+    ) -> list[Job]:
         """Unlock the full portrait set after hero preview + payment."""
         async with self._lock_for(session_id):
             state = self._sessions.get(session_id)
@@ -1349,22 +1699,82 @@ class JobQueue:
                 state.style.value,
                 state.gender,
                 style_data,
+                template_id=template_id,
+                shot_overrides=shot_overrides,
             )
+            # The accepted Hero Preview is the paid set's cover image. Generate
+            # only the remaining five planned compositions so the customer gets
+            # six distinct finals instead of paying for a near-duplicate second
+            # close-up.
+            if plan:
+                plan = plan[1:]
+            completed_shot_ids: set[str] = set()
+            for event in storage.load_generation_events(session_id):
+                if event["status"] != JobStatus.completed.value:
+                    continue
+                try:
+                    event_spec = json.loads(event["shot_spec_json"] or "{}")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                if event_spec.get("shot_id"):
+                    completed_shot_ids.add(str(event_spec["shot_id"]))
+            active_shot_ids = {
+                str((existing.shot_spec or {}).get("shot_id"))
+                for existing in self._jobs.values()
+                if existing.session_id == session_id
+                and existing.job_type == JobType.full_set
+                and existing.status in {JobStatus.queued, JobStatus.processing}
+                and (existing.shot_spec or {}).get("shot_id")
+            }
+            plan = [
+                shot for shot in plan
+                if str(shot.shot_spec.get("shot_id"))
+                not in completed_shot_ids | active_shot_ids
+            ]
             if not plan:
-                state.status = SessionStatus.hero_preview_ready
+                if len(state.generated_images) >= 6:
+                    state.status = SessionStatus.done
+                    storage.update_session_status(
+                        session_id, state.status.value,
+                    )
                 return []
 
             state.status = SessionStatus.generating
             state.unlocked = True
+            storage.update_session_hero_preview(
+                session_id, state.hero_preview_image_id, unlocked=True,
+            )
+            storage.update_session_status(session_id, state.status.value)
             jobs = []
             for shot in plan:
+                shot_spec = dict(shot.shot_spec)
+                prompt = shot.prompt
+                # The accepted Hero already establishes the look. Supplying the
+                # same close-up style image again makes edit models copy its
+                # framing despite a different ShotSpec, producing duplicates.
+                # Remaining shots use identity references plus textual style.
+                template_path = None
+                if custom_style_prompt:
+                    shot_spec["style_id"] = "private_inspiration"
+                    shot_spec["template_id"] = "private_user_reference"
+                    shot_spec["template_label"] = "Private inspiration"
+                    blocks = dict(shot_spec["prompt_blocks"])
+                    blocks["style_block"] = custom_style_prompt
+                    shot_spec["prompt_blocks"] = blocks
+                    prompt = (
+                        f"{custom_style_prompt}\n\nShotSpec:\n"
+                        f"- framing: {shot_spec['framing']}\n"
+                        f"- pose: {shot_spec['pose']}\n"
+                        f"- lighting: {shot_spec['lighting']}\n"
+                        f"- lens: {shot_spec['lens']}"
+                    )
                 job = Job(
                     session_id=session_id,
                     job_type=JobType.full_set,
-                    prompt=shot.prompt,
+                    prompt=prompt,
                     prompt_id=shot.prompt_id,
-                    template_path=self._resolve_template_path(shot.template),
-                    shot_spec=shot.shot_spec,
+                    template_path=template_path,
+                    shot_spec=shot_spec,
                 )
                 self._jobs[job.job_id] = job
                 await self._queue.put(job)
@@ -1528,6 +1938,281 @@ class JobQueue:
             if j.session_id == session_id
         ]
 
+    async def retry_failed_jobs(self, session_id: str) -> list[Job]:
+        """Replace failed in-memory generation jobs with fresh queued jobs."""
+        async with self._lock_for(session_id):
+            state = self.get_session(session_id)
+            if state is None:
+                raise KeyError(session_id)
+            failed = [
+                job for job in self._jobs.values()
+                if job.session_id == session_id
+                and job.status == JobStatus.failed
+                and job.job_type in {JobType.hero_preview, JobType.full_set}
+            ]
+            if not failed:
+                for row in storage.load_generation_events(session_id):
+                    if (
+                        row["status"] != JobStatus.failed.value
+                        or row["failure_reason"] != "set_quality_gate_failed"
+                    ):
+                        continue
+                    try:
+                        metadata = json.loads(row["metadata_json"] or "{}")
+                        shot_spec = json.loads(row["shot_spec_json"] or "{}")
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        continue
+                    retry = metadata.get("support_retry") or {}
+                    prompt = str(retry.get("prompt") or "").strip()
+                    if not prompt:
+                        continue
+                    recovered = Job(
+                        session_id=session_id,
+                        job_type=JobType.full_set,
+                        prompt=prompt,
+                        prompt_id=row["prompt_id"],
+                        shot_spec=shot_spec,
+                    )
+                    recovered.job_id = row["job_id"]
+                    recovered.status = JobStatus.failed
+                    recovered.error = row["error"]
+                    self._jobs[recovered.job_id] = recovered
+                    failed.append(recovered)
+            if not failed:
+                raise ValueError(
+                    "No retryable failed jobs are loaded; use a replacement entitlement "
+                    "or restart the project from its preserved Library state"
+                )
+            replacements = []
+            for old in failed:
+                replacement = Job(
+                    session_id=old.session_id,
+                    job_type=old.job_type,
+                    prompt=old.prompt,
+                    prompt_id=old.prompt_id,
+                    instruction=old.instruction,
+                    revised_image_id=old.revised_image_id,
+                    template_path=old.template_path,
+                    shot_spec=dict(old.shot_spec) if old.shot_spec else None,
+                )
+                self._jobs.pop(old.job_id, None)
+                self._jobs[replacement.job_id] = replacement
+                await self._queue.put(replacement)
+                replacements.append(replacement)
+            state.status = SessionStatus.generating
+            storage.update_session_status(session_id, state.status.value)
+            return replacements
+
+    def prepare_set_quality_retry(self, session_id: str) -> list[str]:
+        """Turn a failed six-frame delivery gate into retryable paid-set jobs.
+
+        The user-confirmed Hero remains the cover. Existing five paid-set
+        outputs are lifecycle-marked so fresh retry results cannot produce an
+        eight- or eleven-image delivery candidate on the next sync.
+        """
+        state = self.get_session(session_id)
+        if state is None:
+            raise KeyError(session_id)
+        retry_shot_ids = []
+        events_by_job_id = {
+            row["job_id"]: row
+            for row in storage.load_generation_events(session_id)
+        }
+        retryable_jobs = [
+            job for job in self._jobs.values()
+            if job.session_id == session_id
+            and job.job_type == JobType.full_set
+            and job.status == JobStatus.completed
+        ]
+        for job in retryable_jobs:
+            job.status = JobStatus.failed
+            job.error = "set_quality_retry_required"
+            shot_id = str((job.shot_spec or {}).get("shot_id") or "")
+            if shot_id:
+                retry_shot_ids.append(shot_id)
+            previous = events_by_job_id.get(job.job_id)
+            try:
+                metadata = json.loads(previous["metadata_json"] or "{}") if previous else {}
+            except (TypeError, ValueError, json.JSONDecodeError):
+                metadata = {}
+            metadata["support_retry"] = {
+                "reason": "set_quality_gate_failed",
+                "prompt": job.prompt,
+                "shot_id": shot_id or None,
+            }
+            _save_generation_event(
+                job,
+                JobStatus.failed,
+                failure_reason="set_quality_gate_failed",
+                error=job.error,
+                result_image_id=(
+                    previous["result_image_id"] if previous else None
+                ),
+                metadata=metadata,
+            )
+
+        for image in state.generated_images:
+            if (
+                image.image_id == state.hero_preview_image_id
+                or image.parent_image_id is not None
+                or image.operation is not None
+            ):
+                continue
+            image.operation = "set_quality_retry_pending"
+            storage.mark_generated_image_operation(
+                session_id, image.image_id, image.operation,
+            )
+
+        state.status = SessionStatus.failed
+        storage.update_session_status(session_id, state.status.value)
+        return list(dict.fromkeys(retry_shot_ids))
+
+    async def _schedule_automatic_full_set_retry(
+        self,
+        session: SessionState,
+        failed_job: Job,
+        reason: str,
+        metadata: dict | None = None,
+    ) -> Job | None:
+        """Atomically replace one failed paid-set shot with a bounded retry."""
+        if (
+            failed_job.job_type != JobType.full_set
+            or failed_job.automatic_retry_count >= MAX_AUTOMATIC_FULL_SET_RETRIES
+            or reason not in {
+                "transient_provider_error",
+                "duplicate_final_asset",
+                "delivery_gate_failed",
+            }
+        ):
+            return None
+
+        replacement_prompt = failed_job.prompt
+        replacement_shot_spec = (
+            dict(failed_job.shot_spec) if failed_job.shot_spec else None
+        )
+        diagnosis = None
+        if reason == "delivery_gate_failed":
+            diagnosis = classify_selected_failure(metadata)
+            if diagnosis["failure_class"] == "none":
+                diagnosis = {
+                    **diagnosis,
+                    "failure_class": "unknown_quality",
+                    "recovery_action": "REGENERATE_FROM_ORIGINAL",
+                    "recovery_strategy": "quality_regeneration",
+                }
+            replacement_shot_spec = build_recovery_shot_spec(
+                replacement_shot_spec,
+                failure_class=diagnosis["failure_class"],
+                attempt=failed_job.automatic_retry_count + 1,
+            )
+            replacement_prompt = compose_recovery_shot_prompt(
+                replacement_prompt,
+                replacement_shot_spec,
+            )
+
+        async with self._lock_for(session.session_id):
+            if self._jobs.get(failed_job.job_id) is not failed_job:
+                return None
+            replacement = Job(
+                session_id=failed_job.session_id,
+                job_type=failed_job.job_type,
+                prompt=replacement_prompt,
+                prompt_id=failed_job.prompt_id,
+                instruction=failed_job.instruction,
+                revised_image_id=failed_job.revised_image_id,
+                template_path=failed_job.template_path,
+                shot_spec=replacement_shot_spec,
+                automatic_retry_count=failed_job.automatic_retry_count + 1,
+                automatic_retry_reason=reason,
+            )
+            self._jobs.pop(failed_job.job_id, None)
+            self._jobs[replacement.job_id] = replacement
+            await self._queue.put(replacement)
+            _bump_generation_metric(session, "automatic_full_set_retries")
+            if diagnosis is not None:
+                replacement.automatic_retry_reason = (
+                    f"delivery_gate_failed:{diagnosis['failure_class']}"
+                )
+            session.status = SessionStatus.generating
+            storage.update_session_status(session.session_id, session.status.value)
+
+        await self._broadcast(session.session_id, {
+            "type": "job_retrying",
+            "failed_job_id": failed_job.job_id,
+            "job_id": replacement.job_id,
+            "prompt_id": replacement.prompt_id,
+            "shot_spec": replacement.shot_spec,
+            "reason": reason,
+            "attempt": replacement.automatic_retry_count,
+            "max_attempts": MAX_AUTOMATIC_FULL_SET_RETRIES,
+            "recovery": diagnosis,
+        })
+        return replacement
+
+    def _persist_generation_batch_status(self, session: SessionState, job: Job) -> None:
+        """Persist a terminal batch status after either success or failure."""
+        if job.job_type == JobType.hero_preview:
+            restored_replacement = (
+                bool(job.replaces_image_id)
+                and session.status == SessionStatus.hero_preview_ready
+                and session.hero_preview_image_id == job.replaces_image_id
+            )
+            if job.status == JobStatus.failed and not restored_replacement:
+                session.status = SessionStatus.failed
+            storage.update_session_status(session.session_id, session.status.value)
+            return
+        if job.job_type != JobType.full_set:
+            storage.update_session_status(session.session_id, session.status.value)
+            return
+        batch = [
+            other for other in self._jobs.values()
+            if other.session_id == session.session_id
+            and other.job_type == job.job_type
+        ]
+        if batch and all(
+            other.status in {JobStatus.completed, JobStatus.failed}
+            for other in batch
+        ):
+            session.status = (
+                SessionStatus.done
+                if all(other.status == JobStatus.completed for other in batch)
+                else SessionStatus.failed
+            )
+        elif any(
+            other.status in {JobStatus.queued, JobStatus.processing}
+            for other in batch
+        ):
+            session.status = SessionStatus.generating
+        storage.update_session_status(session.session_id, session.status.value)
+
+    def _full_set_batch_is_complete(self, session_id: str) -> bool:
+        batch = [
+            other for other in self._jobs.values()
+            if other.session_id == session_id
+            and other.job_type == JobType.full_set
+        ]
+        return bool(batch) and all(
+            other.status == JobStatus.completed for other in batch
+        )
+
+    def _set_visual_review_records(self, session: SessionState) -> list[dict]:
+        records = []
+        for image in session.generated_images:
+            if image.parent_image_id is not None or image.operation is not None:
+                continue
+            if not image_or_source_passed_final_gate(session, image.image_id):
+                continue
+            path = self.get_image_path(session.session_id, image.image_id)
+            if not path:
+                continue
+            records.append({
+                "image_id": image.image_id,
+                "storage_path": str(path),
+                "prompt_id": image.prompt_id,
+                "resemblance": image.resemblance,
+            })
+        return records[-6:]
+
     def get_queue_position(self, job_id: str) -> int:
         """Get position of a job in the queue (0 = currently processing)."""
         pos = 0
@@ -1578,6 +2263,7 @@ class JobQueue:
                 self._worker = GeminiWorker(learning_layer=self._learning_layer)
                 await asyncio.to_thread(self._worker.connect)
                 self._worker_readiness_error = None
+                self._provider_readiness_checked_at = time.monotonic()
                 print("  ✓ API client ready on retry")
             except Exception as exc:
                 self._worker_readiness_error = str(exc)
@@ -1588,6 +2274,10 @@ class JobQueue:
                     "Image generation provider is not ready — verify the API key, "
                     "configured model, region availability, and restart the API"
                 )
+                failed_session = self._sessions.get(job.session_id)
+                if failed_session:
+                    if not self._restore_replaced_hero(failed_session, job):
+                        self._persist_generation_batch_status(failed_session, job)
                 await self._broadcast(job.session_id, {
                     "type": "job_failed",
                     "job_id": job.job_id,
@@ -1601,6 +2291,10 @@ class JobQueue:
                 "Image generation provider is not ready — verify the API key, "
                 "configured model, region availability, and restart the API"
             )
+            failed_session = self._sessions.get(job.session_id)
+            if failed_session:
+                if not self._restore_replaced_hero(failed_session, job):
+                    self._persist_generation_batch_status(failed_session, job)
             await self._broadcast(job.session_id, {
                 "type": "job_failed",
                 "job_id": job.job_id,
@@ -1612,6 +2306,42 @@ class JobQueue:
         if not session:
             job.status = JobStatus.failed
             job.error = "Session not found"
+            return
+
+        provider_readiness = getattr(self._worker, "provider_readiness", None)
+        if (
+            isinstance(provider_readiness, dict)
+            and provider_readiness.get("pass") is False
+        ):
+            job.status = JobStatus.failed
+            job.error = (
+                "Image generation is temporarily unavailable; support has been "
+                "notified and the paid entitlement remains valid"
+            )
+            if job.job_type in {
+                JobType.generate,
+                JobType.hero_preview,
+                JobType.full_set,
+            }:
+                _bump_generation_metric(session, "generation_attempts")
+                _record_shot_attempt(session, job)
+                _record_generation_failure(session, "provider_unavailable")
+                _record_shot_failure(session, job, "provider_unavailable")
+                await asyncio.to_thread(
+                    _save_generation_event,
+                    job,
+                    JobStatus.failed,
+                    "provider_unavailable",
+                    job.error,
+                )
+            if not self._restore_replaced_hero(session, job):
+                session.status = SessionStatus.failed
+                self._persist_generation_batch_status(session, job)
+            await self._broadcast(job.session_id, {
+                "type": "job_failed",
+                "job_id": job.job_id,
+                "error": job.error,
+            })
             return
 
         job.status = JobStatus.processing
@@ -1840,18 +2570,25 @@ class JobQueue:
                         job.error,
                         metadata=resemblance_meta,
                     )
+                    if await self._schedule_automatic_full_set_retry(
+                        session, job, "delivery_gate_failed", resemblance_meta
+                    ):
+                        return
                 has_pending_jobs = any(
                     other.session_id == session.session_id
                     and other.job_id != job.job_id
                     and other.status in {JobStatus.queued, JobStatus.processing}
                     for other in self._jobs.values()
                 )
-                if session.generated_images:
+                if self._restore_replaced_hero(session, job):
+                    pass
+                elif session.generated_images:
                     session.status = SessionStatus.reviewing
                 elif has_pending_jobs:
                     session.status = SessionStatus.generating
                 else:
                     session.status = SessionStatus.failed
+                self._persist_generation_batch_status(session, job)
                 await self._broadcast(job.session_id, {
                     "type": "job_failed",
                     "job_id": job.job_id,
@@ -1892,18 +2629,25 @@ class JobQueue:
                         job.error,
                         metadata=resemblance_meta,
                     )
+                    if await self._schedule_automatic_full_set_retry(
+                        session, job, "duplicate_final_asset"
+                    ):
+                        return
                     has_pending_jobs = any(
                         other.session_id == session.session_id
                         and other.job_id != job.job_id
                         and other.status in {JobStatus.queued, JobStatus.processing}
                         for other in self._jobs.values()
                     )
-                    if session.generated_images:
+                    if self._restore_replaced_hero(session, job):
+                        pass
+                    elif session.generated_images:
                         session.status = SessionStatus.reviewing
                     elif has_pending_jobs:
                         session.status = SessionStatus.generating
                     else:
                         session.status = SessionStatus.failed
+                    self._persist_generation_batch_status(session, job)
                     await self._broadcast(job.session_id, {
                         "type": "job_failed",
                         "job_id": job.job_id,
@@ -1924,7 +2668,19 @@ class JobQueue:
             )
             # Move/copy file to session output dir with image_id name
             dest = session.output_dir / f"{image_id}.png"
+            clean_dest = clean_export_path(dest)
             final_render_started_at = time.time()
+            clean_ai_label = copy_with_ai_metadata(
+                filepath,
+                clean_dest,
+                operation=(
+                    "GENERATE"
+                    if job.job_type in generation_job_types
+                    else "REVISE"
+                ),
+                source="openrouter_gemini",
+                visible_label=False,
+            )
             ai_label = copy_with_ai_metadata(
                 filepath,
                 dest,
@@ -1937,7 +2693,7 @@ class JobQueue:
             )
             if isinstance(resemblance_meta, dict):
                 final_eval = resemblance_meta.setdefault("final_evaluate", {})
-                ai_label_check = build_ai_label_check(ai_label)
+                ai_label_check = build_ai_label_check(ai_label, clean_ai_label)
                 if isinstance(final_eval, dict):
                     final_eval["ai_label_check"] = ai_label_check
                     final_eval["final_render"] = {
@@ -1967,6 +2723,15 @@ class JobQueue:
                         .get("candidate_id")
                     ),
                     **ai_label,
+                    "clean_export": {
+                        "available": clean_dest.is_file(),
+                        "metadata_ai_label": bool(
+                            clean_ai_label.get("metadata_ai_label")
+                        ),
+                        "visible_ai_label": bool(
+                            clean_ai_label.get("visible_ai_label")
+                        ),
+                    },
                     "ai_label_operation": ai_label.get("operation"),
                     "operation": "FINAL_RENDER",
                 }
@@ -1987,6 +2752,12 @@ class JobQueue:
                 session.hero_preview_image_id = image_id
                 session.hero_preview_generated = True
                 session.status = SessionStatus.hero_preview_ready
+                storage.update_session_hero_preview(
+                    session.session_id, image_id, unlocked=session.unlocked,
+                )
+                storage.update_session_status(
+                    session.session_id, session.status.value,
+                )
                 _record_shot_completion(
                     session,
                     job,
@@ -2008,6 +2779,27 @@ class JobQueue:
                     resemblance_meta,
                     image_id,
                 )
+                if (
+                    job.job_type == JobType.full_set
+                    and self._worker is not None
+                    and self._full_set_batch_is_complete(session.session_id)
+                ):
+                    review_records = self._set_visual_review_records(session)
+                    if len(review_records) == 6:
+                        set_visual_review = await asyncio.to_thread(
+                            self._worker.evaluate_portrait_set_visual,
+                            review_records,
+                            str(
+                                session.output_dir
+                                / f".{session.session_id}-set-review.jpg"
+                            ),
+                        )
+                        resemblance_meta["set_visual_review"] = set_visual_review
+                        img.resemblance = resemblance_meta
+                if job.automatic_retry_count:
+                    _bump_generation_metric(
+                        session, "automatic_full_set_retry_successes"
+                    )
                 await asyncio.to_thread(
                     _save_generation_event,
                     job,
@@ -2019,6 +2811,7 @@ class JobQueue:
                 session.status = SessionStatus.reviewing
             # Persist metadata so the gallery (with resemblance scores) survives
             # a backend restart. Pixels are already on disk in output_dir.
+            image_metadata_persisted = False
             try:
                 storage.save_generated_image(
                     image_id=image_id,
@@ -2031,8 +2824,23 @@ class JobQueue:
                     resemblance=resemblance_meta,
                     created_at=img.created_at,
                 )
+                image_metadata_persisted = True
             except Exception as exc:
                 print(f"⚠ Could not persist generated-image metadata ({exc})")
+                if job.replaces_image_id:
+                    img.operation = "failed_preview_retry"
+                    raise RuntimeError(
+                        "Could not persist replacement preview metadata"
+                    ) from exc
+            if image_metadata_persisted:
+                self._supersede_replaced_hero(session, job)
+            if (
+                image_metadata_persisted
+                and job.job_type in {JobType.generate, JobType.full_set}
+            ):
+                # Commit the image row before exposing a terminal batch status so
+                # restart hydration can never observe done with only five assets.
+                self._persist_generation_batch_status(session, job)
 
             await self._broadcast(job.session_id, {
                 "type": "image_ready",
@@ -2046,6 +2854,8 @@ class JobQueue:
             traceback.print_exc()
             job.status = JobStatus.failed
             job.error = str(e)
+            if _is_permanent_provider_error(e):
+                self._mark_provider_unavailable(e)
             if job.job_type in {JobType.generate, JobType.hero_preview, JobType.full_set}:
                 _record_generation_failure(session, "exception")
                 _record_shot_failure(session, job, "exception")
@@ -2056,7 +2866,14 @@ class JobQueue:
                     "exception",
                     job.error,
                 )
-            session.status = SessionStatus.failed
+                if _is_transient_generation_error(e):
+                    if await self._schedule_automatic_full_set_retry(
+                        session, job, "transient_provider_error"
+                    ):
+                        return
+            if not self._restore_replaced_hero(session, job):
+                session.status = SessionStatus.failed
+                self._persist_generation_batch_status(session, job)
 
             await self._broadcast(job.session_id, {
                 "type": "job_failed",
@@ -2065,9 +2882,18 @@ class JobQueue:
             })
         finally:
             if self._worker is not None:
-                end_session = getattr(self._worker, "end_session", None)
-                if callable(end_session):
-                    end_session(job.session_id)
+                release_resources = getattr(
+                    self._worker, "release_job_resources", None
+                )
+                if callable(release_resources):
+                    await asyncio.to_thread(release_resources, job.session_id)
+                else:
+                    end_session = getattr(self._worker, "end_session", None)
+                    if callable(end_session):
+                        end_session(job.session_id)
+            await asyncio.to_thread(
+                _delete_session_intermediate_outputs, job.session_id
+            )
 
     # ── WebSocket management ──────────────────────────
 

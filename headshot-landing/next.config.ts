@@ -1,5 +1,7 @@
 import type { NextConfig } from "next";
 
+const internalApiOrigin = process.env.INTERNAL_API_ORIGIN ?? "http://127.0.0.1:8001";
+
 const nextConfig: NextConfig = {
   images: {
     formats: ["image/avif", "image/webp"],
@@ -15,11 +17,11 @@ const nextConfig: NextConfig = {
     return [
       {
         source: "/api/:path*",
-        destination: "http://localhost:8000/api/:path*",
+        destination: `${internalApiOrigin}/api/:path*`,
       },
       {
         source: "/ws/:path*",
-        destination: "http://localhost:8000/ws/:path*",
+        destination: `${internalApiOrigin}/ws/:path*`,
       },
     ];
   },

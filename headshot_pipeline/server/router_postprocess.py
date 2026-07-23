@@ -17,7 +17,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from .config import settings
-from .delivery_label import copy_with_ai_metadata
+from .delivery_label import clean_export_path, copy_with_ai_metadata
 from .delivery_policy import (
     find_registered_image,
     image_passed_final_gate,
@@ -113,9 +113,17 @@ def _save_and_register(
     """Save processed image with a new ID and register it in the session."""
     image_id = f"pp_{uuid.uuid4().hex[:8]}"
     dest = state.output_dir / f"{image_id}.png"
+    clean_dest = clean_export_path(dest)
 
     # Copy with AI-content metadata so all delivered derivatives preserve the
     # output labeling contract.
+    clean_ai_label = copy_with_ai_metadata(
+        processed_path,
+        clean_dest,
+        operation=operation,
+        source="flashshot_postprocess",
+        visible_label=False,
+    )
     ai_label = copy_with_ai_metadata(
         processed_path,
         dest,
@@ -127,7 +135,7 @@ def _save_and_register(
         processed_path.unlink(missing_ok=True)
 
     delivery_gate = _build_postprocess_delivery_gate_check(state, original_image_id)
-    ai_label_check = build_ai_label_check(ai_label)
+    ai_label_check = build_ai_label_check(ai_label, clean_ai_label)
     resemblance = {
         "final_evaluate": {
             "status": (

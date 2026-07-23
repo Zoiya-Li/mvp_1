@@ -164,6 +164,14 @@ def init_db():
         )
         _ensure_column(conn, "payments", "refunded_at", "refunded_at TEXT")
 
+    # API v2 has an additive schema so v1 sessions and paid orders continue to
+    # work during the portrait-platform migration.
+    from .portrait_catalog import ensure_theme_catalog
+    from .portrait_storage import init_portrait_schema
+
+    init_portrait_schema()
+    ensure_theme_catalog()
+
 
 def _ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str):
     columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
@@ -307,6 +315,20 @@ def delete_session_images(session_id: str):
         )
 
 
+def mark_generated_image_operation(
+    session_id: str,
+    image_id: str,
+    operation: str | None,
+) -> None:
+    """Persist a lifecycle marker without deleting feedback-linked metadata."""
+    with _lock, get_conn() as conn:
+        conn.execute(
+            """UPDATE generated_images SET operation=?
+               WHERE session_id=? AND image_id=?""",
+            (operation, session_id, image_id),
+        )
+
+
 # ── Generation events ───────────────────────────────────
 
 def save_generation_event(
@@ -358,6 +380,25 @@ def load_generation_events(session_id: str) -> list[sqlite3.Row]:
                 (session_id,),
             )
         )
+
+
+def fail_interrupted_generation_events(
+    session_id: str,
+    *,
+    completed_at: datetime,
+) -> int:
+    """Close jobs left processing when the single worker process restarted."""
+    with _lock, get_conn() as conn:
+        cursor = conn.execute(
+            """UPDATE generation_events
+               SET status='failed',
+                   failure_reason='worker_interrupted',
+                   error='Generation worker restarted before this shot completed',
+                   completed_at=?
+               WHERE session_id=? AND status='processing'""",
+            (completed_at.isoformat(), session_id),
+        )
+        return int(cursor.rowcount)
 
 
 def delete_session_generation_events(session_id: str):

@@ -615,3 +615,17 @@ def test_session_pipeline_metrics_use_attempts_for_deliverable_rate():
     assert metrics["shot_metrics"]["half_body"]["estimated_cost_per_deliverable"] == 0
     assert metrics["identity_threshold_metrics"]["closeup"]["avg_user_identity_score"] == 2
     assert metrics["identity_threshold_metrics"]["closeup"]["liked_identity_count"] == 1
+
+
+def test_in_progress_generation_attempt_is_not_reported_as_failure():
+    state = _state_with_images()
+    state.pipeline_metrics = {
+        "generation_attempts": 3,
+        "generation_failures": 0,
+    }
+
+    metrics = state.to_response().pipeline_metrics
+
+    assert metrics["generation_attempts"] == 3
+    assert metrics["generation_failures"] == 0
+    assert metrics["generation_failure_rate"] == 0

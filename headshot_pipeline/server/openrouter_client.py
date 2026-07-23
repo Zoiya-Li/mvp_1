@@ -63,6 +63,7 @@ DEFAULT_MODEL = "google/gemini-3.1-flash-image"
 # this minimal to avoid doubling long timeouts.
 _TRANSIENT_STATUS = {429, 500, 502, 503, 504}
 _RETRY_BACKOFF_S = 3.0
+MAX_DATA_URI_RAW_BYTES = 12 * 1024 * 1024
 
 
 class OpenRouterError(RuntimeError):
@@ -79,8 +80,23 @@ def _b64_data_url(path: str | Path) -> str:
         ".jpeg": "image/jpeg",
         ".webp": "image/webp",
     }.get(ext, "image/jpeg")
-    with open(p, "rb") as f:
-        b64 = base64.b64encode(f.read()).decode("ascii")
+    raw = p.read_bytes()
+    # Some image models return a 4K PNG larger than multimodal providers'
+    # 20 MiB per-data-URI limit after base64 expansion. QA does not need the
+    # original delivery pixels, so make an in-memory inspection proxy while
+    # leaving the generated file untouched.
+    if len(raw) > MAX_DATA_URI_RAW_BYTES:
+        Image = _pil()
+        image = Image.open(BytesIO(raw))
+        image.load()
+        image.thumbnail((2048, 2048), Image.Resampling.LANCZOS)
+        if image.mode != "RGB":
+            image = image.convert("RGB")
+        buffer = BytesIO()
+        image.save(buffer, "JPEG", quality=90, optimize=True)
+        raw = buffer.getvalue()
+        mime = "image/jpeg"
+    b64 = base64.b64encode(raw).decode("ascii")
     return f"data:{mime};base64,{b64}"
 
 

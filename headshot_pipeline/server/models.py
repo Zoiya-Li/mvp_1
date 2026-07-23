@@ -91,7 +91,9 @@ class UserFeedbackResponse(BaseModel):
 # ── Agent pipeline contract models ───────────────────────
 
 PipelineOperation = Literal[
+    "COMPOSITION_SCAFFOLD",
     "CREATE_FROM_REFERENCES",
+    "IDENTITY_BLEND",
     "LOCAL_EDIT",
     "IDENTITY_REPAIR",
     "UPSCALE",
@@ -168,6 +170,7 @@ class ShotSpec(BaseModel):
     sequence: int | None = None
     framing: str
     pose: str
+    environment: str | None = None
     lighting: str
     lens: str
     prompt_blocks: ShotPromptBlocks
@@ -349,9 +352,9 @@ class PaymentStatus(str, Enum):
     refunded = "refunded"
 
 
-# Tier permission table — aligned with landing page Pricing component.
-# Overseas pricing locked at $5 Standard / $10 Pro (decided under #67; $19 was
-# rejected as too close to the ChatGPT Plus price point). Amounts are USD cents.
+# Legacy v1 session tiers retained only for compatibility while the v2 portrait
+# project bridge is active. They are not the customer-facing six-portrait
+# product contract and must not be surfaced by current Web or iOS clients.
 TIER_LIMITS: dict[PricingTier, dict] = {
     PricingTier.free: {
         "label": "Free",
@@ -873,10 +876,9 @@ class SessionState:
                 return default
 
         generation_attempts = max(_int_metric("generation_attempts"), total_images)
-        generation_failures = max(
-            _int_metric("generation_failures"),
-            max(0, generation_attempts - total_images),
-        )
+        # An attempt without an image may still be in progress. The queue
+        # records terminal failures explicitly, so do not infer them here.
+        generation_failures = _int_metric("generation_failures")
         failed_reasons = session_metrics.get("failed_generation_reasons") or {}
         if not isinstance(failed_reasons, dict):
             failed_reasons = {}
@@ -1228,6 +1230,12 @@ class SessionState:
             "deliverable_count": deliverable_count,
             "generation_attempts": generation_attempts,
             "generation_failures": generation_failures,
+            "automatic_full_set_retries": _int_metric(
+                "automatic_full_set_retries"
+            ),
+            "automatic_full_set_retry_successes": _int_metric(
+                "automatic_full_set_retry_successes"
+            ),
             "failed_generation_reasons": failed_reasons,
             "shot_metrics": shot_metrics,
             "identity_threshold_metrics": identity_threshold_metrics,
@@ -1349,6 +1357,9 @@ class Job:
         revised_image_id: str | None = None,
         template_path: str | None = None,
         shot_spec: dict | None = None,
+        automatic_retry_count: int = 0,
+        automatic_retry_reason: str | None = None,
+        replaces_image_id: str | None = None,
     ):
         self.job_id = f"j_{uuid.uuid4().hex[:8]}"
         self.session_id = session_id
@@ -1357,8 +1368,11 @@ class Job:
         self.prompt_id = prompt_id
         self.instruction = instruction
         self.revised_image_id = revised_image_id
+        self.replaces_image_id = replaces_image_id
         self.template_path = template_path
         self.shot_spec = shot_spec
+        self.automatic_retry_count = max(0, automatic_retry_count)
+        self.automatic_retry_reason = automatic_retry_reason
         self.status = JobStatus.queued
         self.progress = 0.0
         self.result_image: GeneratedImage | None = None

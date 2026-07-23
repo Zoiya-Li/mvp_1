@@ -43,8 +43,55 @@ def test_create_reserves_third_slot_for_template(monkeypatch, tmp_path):
     assert base64.b64decode(captured["payload"]["image3"].split(",", 1)[1]) == (
         tmp_path / "template.png"
     ).read_bytes()
-    assert "template only" in captured["payload"]["prompt"]
+    assert "visual-style reference only" in captured["payload"]["prompt"]
+    assert "do not copy its person's identity, framing, camera angle, or pose" in (
+        captured["payload"]["prompt"]
+    )
+    assert "written ShotSpec controls composition" in captured["payload"]["prompt"]
     assert Image.open(result).size == (30, 40)
+
+
+def test_create_without_template_uses_actual_three_identity_image_contract(
+    monkeypatch, tmp_path,
+):
+    provider = SiliconFlowProvider("test-key", output_dir=tmp_path)
+    refs = [_image(tmp_path / f"ref_{index}.png", "red") for index in range(4)]
+    captured = {}
+
+    def fake_request(endpoint, payload, **kwargs):
+        captured["payload"] = payload
+        return {"images": [{"b64_json": _png_b64()}]}
+
+    monkeypatch.setattr(provider, "_request_json", fake_request)
+    provider.create_from_references(
+        "Follow ShotSpec: medium half-body portrait.", refs, None, "half-body"
+    )
+
+    assert set(captured["payload"]) >= {"image", "image2", "image3"}
+    assert "image4" not in captured["payload"]
+    assert "All 3 supplied images are identity references" in captured["payload"]["prompt"]
+    assert "follow the written ShotSpec" in captured["payload"]["prompt"]
+
+
+def test_create_without_images_uses_text_to_image_composition_model(
+    monkeypatch, tmp_path,
+):
+    provider = SiliconFlowProvider("test-key", output_dir=tmp_path)
+    captured = {}
+
+    def fake_request(endpoint, payload, **kwargs):
+        captured["payload"] = payload
+        return {"images": [{"b64_json": _png_b64()}]}
+
+    monkeypatch.setattr(provider, "_request_json", fake_request)
+    provider.create_from_references(
+        "Medium half-body ShotSpec.", [], None, "composition"
+    )
+
+    assert captured["payload"]["model"] == provider.text_to_image_model
+    assert captured["payload"]["image_size"] == "1140x1472"
+    assert "image" not in captured["payload"]
+    assert "No image references are supplied" in captured["payload"]["prompt"]
 
 
 def test_local_edit_puts_current_image_first(monkeypatch, tmp_path):

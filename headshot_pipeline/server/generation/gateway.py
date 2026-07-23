@@ -21,7 +21,9 @@ from .providers import (
 from .smart_router import SmartModelRouter
 
 ImageOperation = Literal[
+    "COMPOSITION_SCAFFOLD",
     "CREATE_FROM_REFERENCES",
+    "IDENTITY_BLEND",
     "LOCAL_EDIT",
     "IDENTITY_REPAIR",
     "UPSCALE",
@@ -37,6 +39,8 @@ class ImageGateway:
 
     def __init__(self) -> None:
         self._openrouter: OpenRouterProvider | None = None
+        self._openrouter_hero: OpenRouterProvider | None = None
+        self._openrouter_recovery: OpenRouterProvider | None = None
         self._siliconflow: SiliconFlowProvider | None = None
         self._chrome: ChromeProvider | None = None
         self._smart_router = SmartModelRouter()
@@ -53,9 +57,47 @@ class ImageGateway:
                 api_key=settings.openrouter_api_key,
                 output_dir=str(settings.output_dir),
                 model=settings.gemini_model,
+                judge_model=settings.openrouter_judge_model,
                 base_url=settings.openrouter_base_url,
                 timeout=settings.gemini_wait_timeout,
+                image_provider=settings.openrouter_image_provider,
+                image_size=settings.openrouter_image_size,
+                estimated_image_cost=settings.openrouter_estimated_image_cost,
+                minimum_credit_balance=settings.openrouter_min_credit_balance,
+                max_reference_images=settings.openrouter_max_reference_images,
             )
+            self._openrouter_hero = OpenRouterProvider(
+                api_key=settings.openrouter_api_key,
+                output_dir=str(settings.output_dir),
+                model=settings.openrouter_hero_model,
+                judge_model=settings.openrouter_judge_model,
+                base_url=settings.openrouter_base_url,
+                timeout=settings.gemini_wait_timeout,
+                image_provider=settings.openrouter_hero_image_provider,
+                image_size=settings.openrouter_image_size,
+                estimated_image_cost=settings.openrouter_hero_estimated_image_cost,
+                minimum_credit_balance=settings.openrouter_min_credit_balance,
+                max_reference_images=settings.openrouter_max_reference_images,
+            )
+            if (
+                settings.openrouter_recovery_model
+                and settings.openrouter_recovery_image_provider
+            ):
+                self._openrouter_recovery = OpenRouterProvider(
+                    api_key=settings.openrouter_api_key,
+                    output_dir=str(settings.output_dir),
+                    model=settings.openrouter_recovery_model,
+                    judge_model=settings.openrouter_judge_model,
+                    base_url=settings.openrouter_base_url,
+                    timeout=settings.gemini_wait_timeout,
+                    image_provider=settings.openrouter_recovery_image_provider,
+                    image_size=settings.openrouter_image_size,
+                    estimated_image_cost=(
+                        settings.openrouter_recovery_estimated_image_cost
+                    ),
+                    minimum_credit_balance=settings.openrouter_min_credit_balance,
+                    max_reference_images=settings.openrouter_max_reference_images,
+                )
         elif settings.gemini_backend == "siliconflow":
             if not settings.siliconflow_api_key:
                 raise SiliconFlowError(
@@ -132,6 +174,21 @@ class ImageGateway:
 
     # -- public semantic API --
 
+    def create_composition_scaffold(
+        self,
+        prompt: str,
+        title: str | None,
+    ) -> str:
+        """Create a reference-free composition that will receive identity later."""
+        provider = self._provider_for("COMPOSITION_SCAFFOLD")
+        return provider.create_from_references(
+            prompt=prompt,
+            reference_paths=[],
+            template_path=None,
+            title=title,
+            editing_mode=False,
+        )
+
     def create_from_references(
         self,
         prompt: str,
@@ -148,6 +205,131 @@ class ImageGateway:
             template_path=template_path,
             title=title,
             editing_mode=editing_mode,
+        )
+
+    def hero_route(self) -> dict:
+        """Return the concrete identity-first route used for Hero generation."""
+        provider = getattr(self, "_openrouter_hero", None)
+        if provider is None:
+            fallback = self._provider_for("CREATE_FROM_REFERENCES")
+            return {
+                "provider": settings.gemini_backend,
+                "model": getattr(fallback, "model", settings.gemini_model),
+                "reason": "active_backend_hero_fallback",
+                "estimated_cost": settings.openrouter_estimated_image_cost,
+                "estimated_latency_ms": 55_000,
+                "confidence": 0.5,
+            }
+        return {
+            "provider": "openrouter",
+            "model": provider.model,
+            "provider_tag": provider.image_provider,
+            "reason": "identity_first_hero_benchmark_winner",
+            "estimated_cost": provider.estimated_image_cost,
+            "estimated_latency_ms": 55_000,
+            "confidence": 0.9,
+        }
+
+    def quality_route(self) -> dict:
+        """Return the photoreal route used for identity-critical set images."""
+        route = self.hero_route()
+        if getattr(self, "_openrouter_hero", None) is not None:
+            route = {
+                **route,
+                "reason": "photoreal_identity_quality_route",
+            }
+        return route
+
+    def has_recovery_route(self) -> bool:
+        """Whether a benchmark-approved alternate generation route is active."""
+        return getattr(self, "_openrouter_recovery", None) is not None
+
+    def recovery_route(self) -> dict | None:
+        provider = getattr(self, "_openrouter_recovery", None)
+        if provider is None:
+            return None
+        return {
+            "provider": "openrouter",
+            "model": provider.model,
+            "provider_tag": provider.image_provider,
+            "reason": "episode_failure_escalation",
+            "estimated_cost": provider.estimated_image_cost,
+            "estimated_latency_ms": 55_000,
+            "confidence": 0.75,
+        }
+
+    def create_recovery_from_references(
+        self,
+        prompt: str,
+        reference_paths: list[str],
+        template_path: str | None,
+        title: str | None,
+    ) -> str:
+        """Generate through the separately benchmarked recovery capability."""
+        provider = getattr(self, "_openrouter_recovery", None)
+        if provider is None:
+            raise RuntimeError("No benchmark-approved recovery route is configured")
+        return provider.create_from_references(
+            prompt=prompt,
+            reference_paths=reference_paths,
+            template_path=template_path,
+            title=title,
+            editing_mode=True,
+        )
+
+    def create_quality_from_references(
+        self,
+        prompt: str,
+        reference_paths: list[str],
+        template_path: str | None,
+        title: str | None,
+    ) -> str:
+        """Generate a set image with the same photoreal model as Hero."""
+        provider = getattr(self, "_openrouter_hero", None)
+        if provider is None:
+            return self.create_from_references(
+                prompt=prompt,
+                reference_paths=reference_paths,
+                template_path=template_path,
+                title=title,
+                editing_mode=True,
+            )
+        return provider.create_from_references(
+            prompt=prompt,
+            reference_paths=reference_paths,
+            template_path=template_path,
+            title=title,
+            editing_mode=True,
+        )
+
+    def create_hero_from_references(
+        self,
+        prompt: str,
+        reference_paths: list[str],
+        title: str | None,
+    ) -> str:
+        """Generate Hero directly from identity references with its tuned model."""
+        return self.create_quality_from_references(
+            prompt=prompt,
+            reference_paths=reference_paths,
+            template_path=None,
+            title=title,
+        )
+
+    def identity_blend(
+        self,
+        current_image_path: str,
+        reference_paths: list[str],
+        blend_prompt: str,
+        title: str | None,
+    ) -> str:
+        """Blend a real identity into an approved scaffold without reframing it."""
+        provider = self._provider_for("IDENTITY_BLEND")
+        return provider.local_edit(
+            current_image_path=current_image_path,
+            reference_paths=reference_paths,
+            edit_prompt=blend_prompt,
+            title=title,
         )
 
     def local_edit(
@@ -191,6 +373,8 @@ class ImageGateway:
         """Clean up all provider-side session state."""
         for p in (
             getattr(self, "_openrouter", None),
+            getattr(self, "_openrouter_hero", None),
+            getattr(self, "_openrouter_recovery", None),
             getattr(self, "_siliconflow", None),
             getattr(self, "_chrome", None),
         ):
@@ -203,4 +387,21 @@ class ImageGateway:
     def check_readiness(self) -> dict:
         """Probe the active generation provider once during worker startup."""
         provider = self._provider_for("CREATE_FROM_REFERENCES")
-        return provider.check_readiness()
+        status = provider.check_readiness()
+        hero = getattr(self, "_openrouter_hero", None)
+        if hero is not None:
+            hero_status = hero._image_client.check_readiness()
+            status = {
+                **status,
+                "hero_generation_ready": bool(hero_status.get("pass")),
+                "hero_model": hero_status.get("model"),
+            }
+        recovery = getattr(self, "_openrouter_recovery", None)
+        if recovery is not None:
+            recovery_status = recovery._image_client.check_readiness()
+            status = {
+                **status,
+                "recovery_generation_ready": bool(recovery_status.get("pass")),
+                "recovery_model": recovery_status.get("model"),
+            }
+        return status

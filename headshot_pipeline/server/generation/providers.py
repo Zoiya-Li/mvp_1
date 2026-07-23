@@ -19,6 +19,27 @@ from pathlib import Path
 from PIL import Image
 
 
+def _reference_role_prompt(identity_count: int, has_template: bool) -> str:
+    if identity_count <= 0:
+        return (
+            "No image references are supplied. Build the scene and composition "
+            "strictly from the written ShotSpec."
+        )
+    if has_template:
+        template_index = identity_count + 1
+        return (
+            f"Images 1 through {identity_count} are identity references of the same person. "
+            f"Preserve only that person's identity. Image {template_index} is a visual-style "
+            "reference only: use its palette, lighting, wardrobe, environment, and texture, "
+            "but do not copy its person's identity, framing, camera angle, or pose. The "
+            "written ShotSpec controls composition."
+        )
+    return (
+        f"All {identity_count} supplied images are identity references of the same person. "
+        "Preserve that person's facial identity consistently and follow the written ShotSpec."
+    )
+
+
 class ImageProvider(ABC):
     """Abstract image-generation provider.
 
@@ -81,25 +102,49 @@ class ImageProvider(ABC):
 
 
 class OpenRouterProvider(ImageProvider):
-    """Provider backed by OpenRouter REST API (google/gemini-3.1-flash-image)."""
+    """OpenRouter image generation plus an independent OpenRouter VLM judge."""
 
     def __init__(
         self,
         api_key: str,
         output_dir: str | Path = "output",
-        model: str = "google/gemini-3.1-flash-image",
+        model: str = "bytedance-seed/seedream-4.5",
+        judge_model: str = "qwen/qwen3-vl-32b-instruct",
         base_url: str = "https://openrouter.ai/api/v1",
         timeout: int = 180,
+        image_provider: str = "seed",
+        image_size: str = "1728x2304",
+        estimated_image_cost: float = 0.04,
+        minimum_credit_balance: float = 3.0,
+        max_reference_images: int = 5,
     ):
         from ..openrouter_client import OpenRouterGeminiClient
+        from ..openrouter_image_client import OpenRouterImageClient
 
-        self._client = OpenRouterGeminiClient(
+        self._image_client = OpenRouterImageClient(
             api_key=api_key,
             output_dir=str(output_dir),
             model=model,
             base_url=base_url,
             timeout=timeout,
+            image_size=image_size,
+            provider_tag=image_provider,
+            estimated_image_cost=estimated_image_cost,
+            minimum_credit_balance=minimum_credit_balance,
+            max_reference_images=max_reference_images,
         )
+        self._judge_client = OpenRouterGeminiClient(
+            api_key=api_key,
+            output_dir=str(output_dir),
+            model=judge_model,
+            base_url=base_url,
+            timeout=timeout,
+        )
+        self.model = model
+        self.image_provider = image_provider
+        self.estimated_image_cost = estimated_image_cost
+        self.judge_model = judge_model
+        self.max_reference_images = max_reference_images
 
     # -- ImageProvider interface --
 
@@ -111,18 +156,19 @@ class OpenRouterProvider(ImageProvider):
         title: str | None,
         editing_mode: bool = True,
     ) -> str:
-        self._client._new_chat()
-        self._client._ref_photos = [p for p in reference_paths if p and Path(p).exists()]
-        self._client._template_path = (
-            template_path if template_path and Path(template_path).exists() else None
+        references = [p for p in reference_paths if p and Path(p).exists()]
+        template = template_path if template_path and Path(template_path).exists() else None
+        reserved_template_slots = 1 if template else 0
+        selected = references[: max(1, self.max_reference_images - reserved_template_slots)]
+        if template:
+            selected.append(template)
+        role_prompt = _reference_role_prompt(
+            len(selected) - reserved_template_slots, template is not None,
         )
-        self._client._in_conversation = True
-        return self._client.start_conversation(
-            prompt=prompt,
-            photo_paths=reference_paths,
+        return self._image_client.generate(
+            prompt=f"{role_prompt}\n\n{prompt}",
+            reference_paths=selected,
             title=title,
-            template_path=template_path,
-            editing_mode=editing_mode,
         )
 
     def local_edit(
@@ -132,13 +178,21 @@ class OpenRouterProvider(ImageProvider):
         edit_prompt: str,
         title: str | None,
     ) -> str:
-        # Ensure the client knows about the current image and references.
-        self._client._last_image_path = current_image_path
-        self._client._ref_photos = [p for p in reference_paths if p and Path(p).exists()]
-        return self._client.converse(
-            prompt=edit_prompt,
+        if not Path(current_image_path).is_file():
+            from ..openrouter_image_client import OpenRouterImageError
+            raise OpenRouterImageError(f"Current image does not exist: {current_image_path}")
+        references = [p for p in reference_paths if p and Path(p).exists()]
+        selected = [current_image_path] + references[: self.max_reference_images - 1]
+        prompt = (
+            "Image 1 is the portrait to edit. Remaining images are identity "
+            "references of the same consenting adult. Apply only the requested "
+            "correction and preserve every unrequested region.\n\n"
+            f"{edit_prompt}"
+        )
+        return self._image_client.generate(
+            prompt=prompt,
+            reference_paths=selected,
             title=title,
-            turn_number=2,
         )
 
     def judge(
@@ -148,10 +202,12 @@ class OpenRouterProvider(ImageProvider):
         judge_prompt: str,
         timeout: int | None = None,
     ) -> str:
-        self._client._last_image_path = current_image_path
-        self._client._ref_photos = [p for p in reference_paths if p and Path(p).exists()]
-        self._client._in_conversation = True
-        return self._client.converse_text(
+        self._judge_client._last_image_path = current_image_path
+        self._judge_client._ref_photos = [
+            p for p in reference_paths if p and Path(p).exists()
+        ]
+        self._judge_client._in_conversation = True
+        return self._judge_client.converse_text(
             prompt=judge_prompt,
             timeout=timeout,
         )
@@ -161,10 +217,15 @@ class OpenRouterProvider(ImageProvider):
         return image_path
 
     def end_session(self) -> None:
-        self._client.end_conversation()
+        self._judge_client.end_conversation()
 
     def check_readiness(self) -> dict:
-        return self._client.check_model_access()
+        image_status = self._image_client.check_readiness()
+        judge_status = self._image_client.check_text_model(self.judge_model)
+        return {
+            **image_status,
+            "judge_model": judge_status.get("model"),
+        }
 
 
 class SiliconFlowError(RuntimeError):
@@ -303,17 +364,10 @@ class SiliconFlowProvider(ImageProvider):
         template = template_path if template_path and Path(template_path).is_file() else None
         if template:
             selected = references[:2] + [template]
-            role_prompt = (
-                "Images 1 and 2 are identity references of the same person. "
-                "Preserve that person's facial identity. Image 3 is a composition/style "
-                "template only; do not copy its person's identity."
-            )
+            role_prompt = _reference_role_prompt(len(selected) - 1, True)
         else:
             selected = references[: self.MAX_EDIT_IMAGES]
-            role_prompt = (
-                "All supplied images are identity references of the same person. "
-                "Preserve their facial identity consistently."
-            )
+            role_prompt = _reference_role_prompt(len(selected), False)
         return self._generate(f"{role_prompt}\n\n{prompt}", selected, title)
 
     def local_edit(

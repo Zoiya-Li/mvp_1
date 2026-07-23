@@ -38,6 +38,8 @@ async def start_hero_preview(
         raise HTTPException(409, "Generation already in progress")
     if state.hero_preview_generated:
         raise HTTPException(409, "Hero preview already generated for this session")
+    if not await queue.refresh_provider_readiness(max_age_seconds=0):
+        raise HTTPException(503, "Portrait generation is temporarily unavailable")
 
     try:
         jobs = await queue.submit_hero_preview(session_id, style_override=style)
@@ -61,6 +63,8 @@ async def unlock_full_set(
         raise HTTPException(409, "Full set already unlocked")
     if state.tier == "free":
         raise HTTPException(403, "Upgrade to a paid tier to unlock the full set")
+    if not await queue.refresh_provider_readiness(max_age_seconds=0):
+        raise HTTPException(503, "Portrait generation is temporarily unavailable")
 
     try:
         jobs = await queue.submit_unlock(session_id)
@@ -82,6 +86,8 @@ async def start_generation(
         raise HTTPException(400, "Upload photos first")
     if state.status.value in ("generating",):
         raise HTTPException(409, "Generation already in progress")
+    if not await queue.refresh_provider_readiness(max_age_seconds=0):
+        raise HTTPException(503, "Portrait generation is temporarily unavailable")
 
     try:
         jobs = await queue.submit_generation(session_id)
@@ -177,6 +183,8 @@ async def start_multi_style_generation(
     limits = TIER_LIMITS[state.tier]
     if limits["max_styles"] < len(req.styles):
         raise HTTPException(403, f"当前套餐最多{limits['max_styles']}种风格，请升级")
+    if not await queue.refresh_provider_readiness(max_age_seconds=0):
+        raise HTTPException(503, "Portrait generation is temporarily unavailable")
 
     try:
         jobs = await queue.submit_multi_style_generation(session_id, req.styles)

@@ -20,6 +20,13 @@ from server.models import GeneratedImage, Job, JobStatus, JobType, SessionState,
 from server import storage  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def isolated_revision_db(tmp_path, monkeypatch):
+    """Revision tests must not inherit a database initialized by another file."""
+    monkeypatch.setattr(storage, "_DB_PATH", tmp_path / "revision-test.db")
+    storage.init_db()
+
+
 def _state(with_consent: bool = True) -> SessionState:
     state = SessionState("s_revision", StyleKey.business, "female", "tok")
     if with_consent:
@@ -61,6 +68,7 @@ def _revision_judgement(identity: int = 9, artifact: int = 9) -> dict:
             "style_match": 9,
             "artifact": artifact,
             "commercial_readiness": 9,
+            "realism": 9,
         },
         "hard_failures": [],
         "recommended_action": "accept",
@@ -279,6 +287,7 @@ def _real_revise_worker(tmp_path):
             self.judge_calls.append({
                 "current_image_path": current_image_path,
                 "reference_paths": list(reference_paths),
+                "judge_prompt": judge_prompt,
             })
             return '{"scores":{"identity":9},"hard_failures":[],"notes":"ok"}'
 
@@ -317,19 +326,41 @@ def test_real_execute_revise_uses_source_image_path_not_undefined(tmp_path):
     assert w._turn_counts["s_revision"] == 2
 
 
-def test_real_worker_has_judge_current_candidate_delegate(tmp_path):
+def test_real_worker_has_judge_current_candidate_delegate(tmp_path, monkeypatch):
     """Regression: GeminiWorker had no _judge_current_candidate, so the job_queue
     revise path raised AttributeError. It now delegates to the eval service."""
     w, spy = _real_revise_worker(tmp_path)
 
+    candidate_path = tmp_path / "revised.png"
+    candidate_path.write_bytes(b"candidate")
+    local_identity_refs = []
+    monkeypatch.setattr(
+        w._eval_service,
+        "_local_image_quality_check",
+        lambda *_args, **_kwargs: {
+            "scores": {}, "hard_failures": [], "measurements": {}, "notes": ""
+        },
+    )
+    monkeypatch.setattr(
+        w._eval_service,
+        "_local_identity_similarity_check",
+        lambda _image_path, refs, **_kwargs: (
+            local_identity_refs.extend(refs)
+            or {"score": None, "cosine_similarity": None, "hard_failures": [], "notes": ""}
+        ),
+    )
+
     judgement = w._judge_current_candidate(
-        str(tmp_path / "revised.png"),
+        str(candidate_path),
         ["ref1.jpg", "ref2.jpg"],
     )
 
     assert isinstance(judgement, dict)
-    assert spy.judge_calls[0]["current_image_path"] == str(tmp_path / "revised.png")
-    assert spy.judge_calls[0]["reference_paths"] == ["ref1.jpg", "ref2.jpg"]
+    assert spy.judge_calls[0]["current_image_path"] == str(candidate_path)
+    assert spy.judge_calls[0]["reference_paths"] == ["ref1.jpg"]
+    assert "Image 1 is the generated candidate" in spy.judge_calls[0]["judge_prompt"]
+    assert "Image 2, when present" in spy.judge_calls[0]["judge_prompt"]
+    assert local_identity_refs == ["ref1.jpg", "ref2.jpg"]
 
 
 def test_real_execute_revise_establishes_its_own_session(tmp_path):

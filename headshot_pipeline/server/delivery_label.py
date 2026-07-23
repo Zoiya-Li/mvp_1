@@ -2,7 +2,9 @@
 
 Delivered artifacts need both an invisible file-level marker and a visible
 content marker. The visible mark is intentionally small and placed in the
-corner so it satisfies the delivery contract without dominating the portrait.
+corner so it satisfies the default delivery contract without dominating the
+portrait. A user-requested clean export keeps the invisible marker and omits
+the visible mark under the clean-export consent contract.
 """
 
 from __future__ import annotations
@@ -18,6 +20,14 @@ AI_NOTICE_VALUE = "Generated or edited by FlashShot AI portrait pipeline"
 AI_SOFTWARE = "FlashShot"
 VISIBLE_LABEL_TEXT = "AI generated"
 MIN_VISIBLE_LABEL_DIM = 96
+CLEAN_EXPORT_TERMS_VERSION = "cn-ai-label-2025-09-v1"
+CLEAN_EXPORT_RETENTION_DAYS = 190
+
+
+def clean_export_path(delivered_path: str | Path) -> Path:
+    """Return the private clean-export sibling for a delivered image."""
+    path = Path(delivered_path)
+    return path.with_name(f"{path.stem}.clean{path.suffix}")
 
 
 def _draw_visible_ai_label(img) -> tuple[object, bool]:
@@ -64,8 +74,9 @@ def copy_with_ai_metadata(
     *,
     operation: str,
     source: str = "flashshot_ai_pipeline",
+    visible_label: bool = True,
 ) -> dict[str, object]:
-    """Copy an image and attach visible + PNG metadata AI-content labels."""
+    """Copy an image and attach PNG metadata plus an optional visible label."""
     src_path = Path(src)
     dest_path = Path(dest)
     try:
@@ -82,10 +93,21 @@ def copy_with_ai_metadata(
             pnginfo.add_text("Software", AI_SOFTWARE)
             pnginfo.add_text("FlashShotOperation", operation)
             pnginfo.add_text("FlashShotSource", source)
-            pnginfo.add_text("FlashShotVisibleLabelReserved", "true")
+            pnginfo.add_text(
+                "FlashShotVisibleLabelReserved",
+                "true" if visible_label else "false",
+            )
             pnginfo.add_text("FlashShotVisibleLabel", VISIBLE_LABEL_TEXT)
+            pnginfo.add_text(
+                "FlashShotCleanExport",
+                "false" if visible_label else "true",
+            )
 
-            out, visible_applied = _draw_visible_ai_label(img)
+            if visible_label:
+                out, visible_applied = _draw_visible_ai_label(img)
+            else:
+                out = img.convert("RGBA")
+                visible_applied = False
             pnginfo.add_text(
                 "FlashShotVisibleLabelApplied",
                 "true" if visible_applied else "false",
@@ -94,7 +116,8 @@ def copy_with_ai_metadata(
             return {
                 "metadata_ai_label": True,
                 "visible_ai_label": visible_applied,
-                "visible_label_reserved": True,
+                "visible_label_reserved": visible_label,
+                "clean_export": not visible_label,
                 "operation": operation,
                 "source": source,
             }
@@ -104,6 +127,7 @@ def copy_with_ai_metadata(
             "metadata_ai_label": False,
             "visible_ai_label": False,
             "visible_label_reserved": False,
+            "clean_export": not visible_label,
             "operation": operation,
             "source": source,
         }

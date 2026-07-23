@@ -1,7 +1,8 @@
 """Image provider gateway metadata and cost estimation.
 
 MVP still routes to one primary image model, but business logic should speak in
-operations (CREATE_FROM_REFERENCES / LOCAL_EDIT / UPSCALE / FINAL_RENDER) and
+operations (COMPOSITION_SCAFFOLD / CREATE_FROM_REFERENCES / IDENTITY_BLEND /
+LOCAL_EDIT / UPSCALE / FINAL_RENDER) and
 capability records rather than scattering provider constants through the agent loop.
 """
 
@@ -14,7 +15,9 @@ from .config import settings
 from .models import ProviderInvocation
 
 ImageOperation = Literal[
+    "COMPOSITION_SCAFFOLD",
     "CREATE_FROM_REFERENCES",
+    "IDENTITY_BLEND",
     "LOCAL_EDIT",
     "IDENTITY_REPAIR",
     "UPSCALE",
@@ -43,11 +46,11 @@ OPENROUTER_GEMINI_CAPABILITIES = ProviderCapabilities(
     supports_multiple_references=True,
     supports_mask_edit=False,
     supports_high_fidelity=True,
-    supports_seed=False,
+    supports_seed=True,
     supports_portrait_ratio=True,
-    max_reference_images=4,
-    average_latency_ms=18_000,
-    estimated_cost=0.12,
+    max_reference_images=settings.openrouter_max_reference_images,
+    average_latency_ms=55_000,
+    estimated_cost=settings.openrouter_estimated_image_cost,
     supported_tasks=(
         "hero_face",
         "half_body",
@@ -75,6 +78,20 @@ SILICONFLOW_QWEN_CAPABILITIES = ProviderCapabilities(
         "environmental",
         "local_edit",
     ),
+)
+
+SILICONFLOW_QWEN_COMPOSITION_CAPABILITIES = ProviderCapabilities(
+    provider="siliconflow",
+    model=settings.siliconflow_text_to_image_model,
+    supports_multiple_references=False,
+    supports_mask_edit=False,
+    supports_high_fidelity=True,
+    supports_seed=True,
+    supports_portrait_ratio=True,
+    max_reference_images=0,
+    average_latency_ms=42_000,
+    estimated_cost=settings.siliconflow_estimated_image_cost,
+    supported_tasks=("half_body", "full_body", "environmental", "composition"),
 )
 
 CHROME_GEMINI_CAPABILITIES = ProviderCapabilities(
@@ -141,6 +158,12 @@ LOCAL_UPSCALE_CAPABILITIES = ProviderCapabilities(
 
 
 def provider_for_operation(operation: ImageOperation) -> ProviderCapabilities:
+    if operation == "COMPOSITION_SCAFFOLD":
+        if getattr(settings, "gemini_backend", "openrouter") == "siliconflow":
+            return SILICONFLOW_QWEN_COMPOSITION_CAPABILITIES
+        if getattr(settings, "gemini_backend", "openrouter") == "chrome":
+            return CHROME_GEMINI_CAPABILITIES
+        return OPENROUTER_GEMINI_CAPABILITIES
     if operation == "IDENTITY_REPAIR":
         return LOCAL_IDENTITY_REPAIR_CAPABILITIES
     if operation == "UPSCALE":

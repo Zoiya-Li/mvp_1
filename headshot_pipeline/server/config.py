@@ -13,10 +13,10 @@ class Settings(BaseSettings):
     port: int = 8000
 
     # ── Generation backend switch ───────────────────────────────
-    # "openrouter"  -> Gemini image models through OpenRouter
-    # "siliconflow" -> Qwen Image Edit + Qwen VLM judge through SiliconFlow (default)
+    # "openrouter"  -> Gemini image models through OpenRouter (default; production)
+    # "siliconflow" -> Qwen Image Edit + Qwen VLM judge through SiliconFlow
     # "chrome"      -> drive gemini.google.com via an already-running Chrome CDP
-    gemini_backend: Literal["openrouter", "siliconflow", "chrome"] = "siliconflow"
+    gemini_backend: Literal["openrouter", "siliconflow", "chrome"] = "openrouter"
 
     # Chrome backend settings (only used when gemini_backend == "chrome").
     # The chrome_cdp_port is also kept for the legacy persistent_client.py CLI.
@@ -30,22 +30,41 @@ class Settings(BaseSettings):
     output_dir: Path | None = None  # derived in model_post_init if unset
     gemini_wait_timeout: int = 180
 
-    # Image generation config for Nano Banana 2. aspect_ratio must be one of the
-    # ratios supported by google/gemini-3.1-flash-image: 1:1, 4:3, 3:4,
-    # 16:9, 9:16. image_size is one of: 512, 1K, 2K, 4K (long edge).
+    # Legacy Gemini image settings retained for the optional chat-completions
+    # image client. Production OpenRouter generation uses the dedicated Image
+    # API settings below.
     gemini_image_aspect_ratio: str = "3:4"
     gemini_image_size: str = "1K"
 
-    # ── OpenRouter Gemini API (production generation path) ────────
-    # The pipeline now drives gemini-3.1-flash-image via the OpenRouter
-    # REST API instead of a headless Chrome session (the Chrome path was the
-    # single biggest source of "needs constant debugging": login expiry, DOM
-    # drift, VNC re-login, profile locks). Set OPENROUTER_API_KEY in .env —
-    # NEVER hardcode the key in source. Empty key => the worker refuses to
-    # start with a clear error (there is no logged-in session to fall back on).
+    # ── OpenRouter dedicated Image API (production generation path) ──
+    # ``gemini_model`` is a legacy env name kept for deployment compatibility;
+    # it now identifies the active OpenRouter image model.
     openrouter_api_key: str = ""
-    gemini_model: str = "google/gemini-3.1-flash-image"
+    gemini_model: str = "bytedance-seed/seedream-4.5"
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
+    openrouter_judge_model: str = "qwen/qwen3-vl-32b-instruct"
+    openrouter_image_provider: str = "seed"
+    openrouter_image_size: str = "1728x2304"
+    openrouter_estimated_image_cost: float = 0.04
+    # FLUX.2 Pro is the identity-critical base generator for Hero and the paid
+    # set. Seedream remains available for bounded local edits; production E2E
+    # showed its raw portraits repeatedly failed the skin-texture realism gate.
+    openrouter_hero_model: str = "black-forest-labs/flux.2-pro"
+    openrouter_hero_image_provider: str = "black-forest-labs"
+    openrouter_hero_estimated_image_cost: float = 0.12
+    # Optional benchmark-approved route used only after the primary route has
+    # failed the same quality class. Empty by default: a model is never promoted
+    # to recovery duty merely because its API is available.
+    openrouter_recovery_model: str = ""
+    openrouter_recovery_image_provider: str = ""
+    openrouter_recovery_estimated_image_cost: float = 0.15
+    hero_identity_cosine_accept_threshold: float = 0.78
+    # Multi-view references naturally disagree because of pose, expression,
+    # and phone-lens distortion. Hero may calibrate down to the pack's own
+    # consistency, but never below this conservative same-person floor.
+    hero_identity_cosine_reference_floor: float = 0.76
+    openrouter_min_credit_balance: float = 3.0
+    openrouter_max_reference_images: int = 5
     # SiliconFlow image/edit + VLM judge backend. The same account key can
     # access both /images/generations and OpenAI-compatible /chat/completions.
     siliconflow_api_key: str = ""
@@ -66,8 +85,10 @@ class Settings(BaseSettings):
     cors_origins: list[str] = [
         "http://localhost:3000",
         "http://localhost:3001",
+        "http://localhost:3010",
         "http://127.0.0.1:3000",
         "http://127.0.0.1:3001",
+        "http://127.0.0.1:3010",
         "https://flashshot.top",
         "https://www.flashshot.top",
     ]
@@ -94,14 +115,37 @@ class Settings(BaseSettings):
     paddle_price_premium_id: str = ""  # pri_... for the $10 Pro tier
     paddle_return_url: str = "https://flashshot.top/checkout"  # approved Paddle.js page
 
-    # Retention: delete source/generated files N days after delivery.
-    retention_days: int = 7
+    # Apple is the primary payment and account provider for the native iOS app.
+    # The server validates Sign in with Apple identity tokens and StoreKit 2
+    # signed transactions; the client can never grant its own entitlement.
+    apple_client_id: str = "com.flashshot.app"
+    apple_bundle_id: str = "com.flashshot.app"
+    apple_app_id: int | None = None
+    apple_iap_environment: Literal["sandbox", "production"] = "sandbox"
+    apple_iap_product_id: str = "portrait_set_6"
+    apple_root_cert_dir: Path = Path(__file__).resolve().parent.parent / "config" / "apple-root-certs"
+    apple_jwks_url: str = "https://appleid.apple.com/auth/keys"
+    apple_identity_issuer: str = "https://appleid.apple.com"
+    trusted_proxy_ips: list[str] = ["127.0.0.1", "::1"]
+    guest_create_limit_10m: int = 10
+    guest_create_limit_day: int = 5
+    preview_limit_ip_day: int = 5
+    support_admin_token: str = ""
+
+    # Layered retention. Identity/inspiration sources expire first; generated
+    # portraits remain available longer; operational metadata is last.
+    source_retention_days: int = 7
+    generated_retention_days: int = 30
+    metadata_retention_days: int = 90
+    retention_days: int = 7  # legacy env compatibility
 
     # Face-swap post-processing (InsightFace inswapper_128). When enabled the
     # worker swaps the user's detected face onto the Gemini-generated portrait
     # as a final identity-preservation step.
     face_swap_enabled: bool = True
-    face_swap_model_path: Path = Path("models/inswapper_128.onnx")
+    face_swap_model_path: Path = (
+        Path(__file__).resolve().parent.parent / "models" / "inswapper_128.onnx"
+    )
 
     # ICP filing number (legally required for China-facing sites). Set in env
     # for production; empty hides the footer line.
@@ -158,6 +202,31 @@ class Settings(BaseSettings):
             errors.append("SILICONFLOW_API_KEY is missing")
         if self.payment_mock_enabled:
             errors.append("PAYMENT_MOCK_ENABLED must be off in production")
+        if not self.apple_client_id:
+            errors.append("APPLE_CLIENT_ID is missing")
+        if not self.apple_bundle_id:
+            errors.append("APPLE_BUNDLE_ID is missing")
+        if not self.apple_iap_product_id:
+            errors.append("APPLE_IAP_PRODUCT_ID is missing")
+        if self.apple_iap_environment != "production":
+            errors.append("APPLE_IAP_ENVIRONMENT must be production")
+        if self.apple_app_id is None:
+            errors.append("APPLE_APP_ID is missing")
+        root_certs = list(self.apple_root_cert_dir.glob("*.cer")) if self.apple_root_cert_dir.exists() else []
+        if not root_certs:
+            errors.append("Apple root certificates are missing")
+        if self.face_swap_enabled and not self.face_swap_model_path.exists():
+            errors.append(f"face-swap model is missing: {self.face_swap_model_path}")
+        face_swap_emap = self.face_swap_model_path.with_suffix(".emap.npy")
+        if self.face_swap_enabled and not face_swap_emap.exists():
+            errors.append(f"face-swap embedding map is missing: {face_swap_emap}")
+        if len(self.support_admin_token) < 32:
+            errors.append("SUPPORT_ADMIN_TOKEN must contain at least 32 characters")
+        return errors
+
+    def web_payment_readiness_errors(self) -> list[str]:
+        """Optional Paddle readiness for the companion website."""
+        errors = []
         if self.paddle_environment != "production":
             errors.append("PADDLE_ENVIRONMENT must be production")
         if not self.paddle_api_key:
@@ -170,8 +239,6 @@ class Settings(BaseSettings):
             errors.append("PADDLE_PRICE_STANDARD_ID is missing")
         if not self.paddle_price_premium_id:
             errors.append("PADDLE_PRICE_PREMIUM_ID is missing")
-        if self.face_swap_enabled and not self.face_swap_model_path.exists():
-            errors.append(f"face-swap model is missing: {self.face_swap_model_path}")
         return errors
 
 

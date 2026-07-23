@@ -68,6 +68,7 @@ async def create_payment(
     except RuntimeError as exc:
         # Payment not configured (no mock + no Paddle creds).
         raise HTTPException(503, str(exc))
+    PaymentService.schedule_mock_confirmation(record.payment_id)
     return record
 
 

@@ -17,7 +17,11 @@ if str(_PIPELINE) not in sys.path:
 
 from server.job_queue import (  # noqa: E402
     JobQueue,
+    _generation_metrics_from_event_rows,
+    _is_permanent_provider_error,
+    _is_transient_generation_error,
     _record_shot_completion,
+    _save_generation_event,
     append_final_render_invocation,
     build_delivery_gate_check,
     final_duplicate_check,
@@ -87,6 +91,225 @@ def test_delivery_gate_check_reports_final_evaluate_issues():
     assert check["selected_candidate_id"] == "cand_1"
     assert check["hard_gate_failures"] == ["identity_fail"]
     assert check["issues"] == ["identity_fail", "not_deliverable"]
+
+
+def test_full_set_batch_status_is_persisted_only_when_all_jobs_finish():
+    q = JobQueue()
+    state = SessionState("s_batch_status", StyleKey.business, "female", "tok")
+    storage.save_session(
+        state.session_id, state.owner_token, state.style.value,
+        state.gender, state.created_at,
+    )
+    state.status = SessionStatus.generating
+    q._sessions[state.session_id] = state
+    jobs = [
+        Job(
+            session_id=state.session_id,
+            job_type=JobType.full_set,
+            prompt=f"shot {index}",
+            prompt_id=f"shot_{index}",
+        )
+        for index in range(6)
+    ]
+    for job in jobs:
+        q._jobs[job.job_id] = job
+    for job in jobs[:5]:
+        job.status = JobStatus.completed
+    jobs[-1].status = JobStatus.processing
+
+    q._persist_generation_batch_status(state, jobs[0])
+    assert state.status == SessionStatus.generating
+    assert storage.load_session_row(state.session_id)["status"] == "generating"
+
+    jobs[-1].status = JobStatus.completed
+    q._persist_generation_batch_status(state, jobs[-1])
+    assert state.status == SessionStatus.done
+    assert storage.load_session_row(state.session_id)["status"] == "done"
+
+
+def test_full_set_batch_failure_is_persisted_after_batch_settles():
+    q = JobQueue()
+    state = SessionState("s_batch_failure", StyleKey.business, "female", "tok")
+    storage.save_session(
+        state.session_id, state.owner_token, state.style.value,
+        state.gender, state.created_at,
+    )
+    q._sessions[state.session_id] = state
+    jobs = [
+        Job(
+            session_id=state.session_id,
+            job_type=JobType.full_set,
+            prompt=f"shot {index}",
+            prompt_id=f"shot_{index}",
+        )
+        for index in range(6)
+    ]
+    for job in jobs:
+        job.status = JobStatus.completed
+        q._jobs[job.job_id] = job
+    jobs[2].status = JobStatus.failed
+
+    q._persist_generation_batch_status(state, jobs[2])
+
+    assert state.status == SessionStatus.failed
+    assert storage.load_session_row(state.session_id)["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_transient_full_set_failure_gets_one_automatic_whole_job_retry():
+    q = JobQueue()
+    state = SessionState("s_auto_retry", StyleKey.cinematic, "female", "tok")
+    storage.save_session(
+        state.session_id, state.owner_token, state.style.value,
+        state.gender, state.created_at,
+    )
+    q._sessions[state.session_id] = state
+    failed = Job(
+        session_id=state.session_id,
+        job_type=JobType.full_set,
+        prompt="half body portrait",
+        prompt_id="shot_half_body",
+        shot_spec={"shot_id": "half_body"},
+    )
+    failed.status = JobStatus.failed
+    q._jobs[failed.job_id] = failed
+    _save_generation_event(
+        failed, JobStatus.failed, "transient_provider_error", "provider timeout"
+    )
+
+    replacement = await q._schedule_automatic_full_set_retry(
+        state, failed, "transient_provider_error"
+    )
+
+    assert replacement is not None
+    assert failed.job_id not in q._jobs
+    assert replacement.automatic_retry_count == 1
+    assert replacement.automatic_retry_reason == "transient_provider_error"
+    assert q._queue.get_nowait() is replacement
+    q._queue.task_done()
+    assert state.pipeline_metrics["automatic_full_set_retries"] == 1
+    assert storage.load_session_row(state.session_id)["status"] == "generating"
+
+    replacement.status = JobStatus.failed
+    assert await q._schedule_automatic_full_set_retry(
+        state, replacement, "transient_provider_error"
+    ) is None
+    assert list(q._jobs.values()) == [replacement]
+
+
+@pytest.mark.asyncio
+async def test_quality_gate_failure_uses_lower_risk_shot_variant():
+    q = JobQueue()
+    state = SessionState("s_no_quality_retry", StyleKey.cinematic, "female", "tok")
+    failed = Job(
+        session_id=state.session_id,
+        job_type=JobType.full_set,
+        prompt="half body portrait",
+        prompt_id="shot_half_body",
+        shot_spec={"shot_id": "half_body"},
+    )
+    failed.status = JobStatus.failed
+    q._jobs[failed.job_id] = failed
+
+    replacement = await q._schedule_automatic_full_set_retry(
+        state, failed, "delivery_gate_failed"
+    )
+
+    assert replacement is not None
+    assert replacement.prompt != failed.prompt
+    assert replacement.shot_spec["shot_id"] == "half_body"
+    assert replacement.shot_spec["canonical_shot_id"] == "half_body"
+    assert replacement.shot_spec["shot_variant"] == "waist_up_relaxed"
+    assert replacement.shot_spec["recovery_failure_class"] == "unknown_quality"
+    assert q._queue.get_nowait() is replacement
+    q._queue.task_done()
+
+
+def test_automatic_retry_metrics_survive_event_rehydration():
+    original = Job(
+        "s_retry_metrics", JobType.full_set, "shot",
+        prompt_id="shot_profile", shot_spec={"shot_id": "profile"},
+    )
+    original.status = JobStatus.failed
+    _save_generation_event(
+        original, JobStatus.failed, "delivery_gate_failed", "quality failed"
+    )
+    replacement = Job(
+        "s_retry_metrics", JobType.full_set, "shot",
+        prompt_id="shot_profile", shot_spec={"shot_id": "profile"},
+        automatic_retry_count=1,
+        automatic_retry_reason="delivery_gate_failed",
+    )
+    replacement.status = JobStatus.completed
+    _save_generation_event(
+        replacement, JobStatus.completed, result_image_id="img_recovered"
+    )
+
+    metrics = _generation_metrics_from_event_rows(
+        storage.load_generation_events("s_retry_metrics")
+    )
+
+    assert metrics["generation_attempts"] == 2
+    assert metrics["generation_failures"] == 1
+    assert metrics["automatic_full_set_retries"] == 1
+    assert metrics["automatic_full_set_retry_successes"] == 1
+
+
+def test_provider_error_retry_classification_is_fail_closed():
+    insufficient = RuntimeError(
+        'SiliconFlow images/generations failed with HTTP 403: '
+        '{"message":"account balance is insufficient"}'
+    )
+    overloaded = RuntimeError("OpenRouter API error 503: upstream unavailable")
+    bug = RuntimeError("unexpected metadata shape")
+
+    assert _is_permanent_provider_error(insufficient) is True
+    assert _is_transient_generation_error(insufficient) is False
+    assert _is_transient_generation_error(overloaded) is True
+    assert _is_permanent_provider_error(overloaded) is False
+    assert _is_transient_generation_error(bug) is False
+    assert _is_permanent_provider_error(bug) is False
+
+
+@pytest.mark.asyncio
+async def test_provider_account_failure_disables_generation_and_fast_fails_queue():
+    q = JobQueue()
+    q._worker = type(
+        "Worker",
+        (),
+        {"provider_readiness": {"pass": True, "provider": "siliconflow"}},
+    )()
+    account_error = RuntimeError(
+        "SiliconFlow images/generations failed with HTTP 403: "
+        "account balance is insufficient"
+    )
+    q._mark_provider_unavailable(account_error)
+
+    assert q.generation_ready is False
+    assert q.worker_readiness_error == str(account_error)
+
+    state = SessionState("s_provider_down", StyleKey.fashion, "female", "tok")
+    storage.save_session(
+        state.session_id, state.owner_token, state.style.value,
+        state.gender, state.created_at,
+    )
+    q._sessions[state.session_id] = state
+    job = Job(
+        state.session_id, JobType.full_set, "profile portrait",
+        prompt_id="shot_profile", shot_spec={"shot_id": "profile"},
+    )
+    q._jobs[job.job_id] = job
+
+    await q._execute_job(job)
+
+    assert job.status == JobStatus.failed
+    assert state.pipeline_metrics["generation_attempts"] == 1
+    assert state.pipeline_metrics["generation_failures"] == 1
+    assert state.pipeline_metrics["failed_generation_reasons"] == {
+        "provider_unavailable": 1
+    }
+    events = storage.load_generation_events(state.session_id)
+    assert events[0]["failure_reason"] == "provider_unavailable"
 
 
 def test_shot_completion_counts_deliverable_only_when_hard_gate_passes():
@@ -304,7 +527,7 @@ async def test_non_deliverable_generation_is_not_saved_to_gallery(tmp_path):
     await q._execute_job(job)
 
     assert job.status == JobStatus.failed
-    assert "No deliverable portrait passed final QA" in job.error
+    assert "没有写真通过最终质量检查" in job.error
     assert "identity_fail" in job.error
     assert job.result_image is None
     assert state.status == SessionStatus.failed
@@ -372,7 +595,7 @@ async def test_all_generation_products_reject_non_deliverable_images(tmp_path, j
     await q._execute_job(job)
 
     assert job.status == JobStatus.failed
-    assert "No deliverable portrait passed final QA" in job.error
+    assert "没有写真通过最终质量检查" in job.error
     assert state.generated_images == []
     assert state.hero_preview_generated is False
     assert state.hero_preview_image_id is None

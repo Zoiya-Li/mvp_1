@@ -236,3 +236,77 @@ class TestCalibration:
         assert thresholds["calibration_sample_count"] == 20
         assert thresholds["identity_pass_threshold"] == pytest.approx(7.05)
         assert thresholds["identity_repair_threshold"] == pytest.approx(5.95)
+
+
+class TestRecoveryStrategyMemory:
+    def test_records_anonymous_pipeline_outcome_and_aggregates(self, tmp_path):
+        ll = _make_layer(tmp_path)
+        ll.record_pipeline_outcome(
+            failure_class="synthetic_texture",
+            action="REGENERATE_FROM_ORIGINAL",
+            strategy="photoreal_regeneration",
+            route_mode="primary",
+            model="model-a",
+            shot_profile="closeup",
+            passed=True,
+            identity_score=8.5,
+            quality_score=9.0,
+            cost=0.12,
+        )
+
+        rows = ll.strategy_stats(
+            failure_class="synthetic_texture",
+            shot_profile="closeup",
+        )
+
+        assert len(rows) == 1
+        assert rows[0]["samples"] == 1
+        assert rows[0]["passes"] == 1
+        assert rows[0]["pass_rate"] == 1.0
+        assert rows[0]["mean_cost"] == pytest.approx(0.12)
+
+    def test_strategy_prior_is_inactive_below_evidence_floor(self, tmp_path):
+        ll = _make_layer(tmp_path)
+        for _ in range(19):
+            ll.record_pipeline_outcome(
+                failure_class="composition",
+                action="REGENERATE_FROM_ORIGINAL",
+                strategy="composition_regeneration",
+                route_mode="primary",
+                model="model-a",
+                shot_profile="half_body",
+                passed=True,
+            )
+
+        adjustment = ll.strategy_adjustment(
+            failure_class="composition",
+            action="REGENERATE_FROM_ORIGINAL",
+            shot_profile="half_body",
+        )
+
+        assert adjustment["active"] is False
+        assert adjustment["multiplier"] == 1.0
+
+    def test_strategy_prior_uses_conservative_confidence_bound(self, tmp_path):
+        ll = _make_layer(tmp_path)
+        for index in range(25):
+            ll.record_pipeline_outcome(
+                failure_class="composition",
+                action="REGENERATE_FROM_ORIGINAL",
+                strategy="composition_regeneration",
+                route_mode="primary",
+                model="model-a",
+                shot_profile="half_body",
+                passed=index < 20,
+            )
+
+        adjustment = ll.strategy_adjustment(
+            failure_class="composition",
+            action="REGENERATE_FROM_ORIGINAL",
+            shot_profile="half_body",
+        )
+
+        assert adjustment["active"] is True
+        assert adjustment["samples"] == 25
+        assert 0.85 <= adjustment["multiplier"] <= 1.15
+        assert adjustment["wilson_lower_bound"] < adjustment["pass_rate"]

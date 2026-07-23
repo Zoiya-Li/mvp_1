@@ -15,6 +15,7 @@ import math
 from typing import Any
 
 from .agent_router import AgentRouter, IDENTITY_REPAIR_THRESHOLD, IDENTITY_PASS_THRESHOLD, QUALITY_ACCEPT_THRESHOLD
+from .failure_taxonomy import classify_failure
 
 
 class PolicyEngine:
@@ -100,6 +101,16 @@ class PolicyEngine:
             identity_thresholds=identity_thresholds,
         )
         base_action = base_decision["action"]
+        from .evaluator import EvaluationService
+        resolved_thresholds = self._router._resolve_thresholds(identity_thresholds)
+        current_gate = EvaluationService._candidate_gate_status(
+            judgement,
+            resolved_thresholds,
+        )
+        diagnosis = classify_failure(
+            judgement,
+            gate_failures=current_gate.get("hard_gate_failures") or [],
+        )
 
         # 1.5 Hard constraints override everything
         hard_override = self._hard_constraint_override(judgement, identity_thresholds)
@@ -113,6 +124,7 @@ class PolicyEngine:
                 "budget_modifier": 1.0,
                 "risk_profile": 0.0,
                 "feedback_modifier": 0.0,
+                **diagnosis,
             }
 
         # 2. Compute context modifiers
@@ -128,6 +140,7 @@ class PolicyEngine:
             edit_count=edit_count,
             identity_repairs=identity_repairs,
             identity_thresholds=identity_thresholds,
+            shot_profile=self._shot_profile_name(shot_spec),
         )
 
         # 4. Select highest-scoring feasible action. Policy scoring may rank
@@ -160,12 +173,18 @@ class PolicyEngine:
             "action": best_action,
             "reason": reason,
             "policy_scores": {a: round(s["score"], 3) for a, s in policy_scores.items()},
+            "policy_evidence": {
+                action: item["learning_adjustment"]
+                for action, item in policy_scores.items()
+                if item.get("learning_adjustment", {}).get("active")
+            },
             "eligible_actions": feasible_actions,
             "confidence": round(confidence, 3),
             "base_action": base_action,
             "budget_modifier": round(budget_modifier, 3),
             "risk_profile": risk_profile.get("risk", 0.5),
             "feedback_modifier": round(feedback_modifier, 3),
+            **diagnosis,
         }
 
     def select_candidate(self, candidates: list[dict]) -> dict | None:
@@ -180,6 +199,7 @@ class PolicyEngine:
         self,
         judgement: dict,
         identity_thresholds: dict | None = None,
+        shot_profile: str = "default",
     ) -> bool:
         """Delegate to AgentRouter for backward compatibility."""
         return self._router.should_apply_identity_repair(judgement, identity_thresholds)
@@ -191,6 +211,7 @@ class PolicyEngine:
         scores_data = judgement.get("scores", {}) or {}
         identity = scores_data.get("identity")
         failures = set(judgement.get("hard_failures") or [])
+        diagnosis = classify_failure(judgement)
 
         # Safety is always a hard gate
         if "unsafe_content" in failures:
@@ -200,17 +221,45 @@ class PolicyEngine:
         if any(f in failures for f in ("no_face", "identity_no_generated_face", "no_face_detected")):
             return {"REGENERATE_FROM_ORIGINAL": {"score": 1.0}}
 
-        # Identity below repair threshold → must regenerate (not repairable)
+        if "identity_geometry_drift" in failures:
+            return {"REGENERATE_WITH_POSE_REFERENCE": {"score": 1.0}}
+
+        # A low-identity but otherwise excellent frame is precisely what the
+        # deterministic identity writer is for. Regenerate only when quality,
+        # composition, safety, or face detection makes that repair unsafe.
         thresholds = self._router._resolve_thresholds(identity_thresholds)
         identity_repair_threshold = float(
             thresholds.get("identity_repair_threshold", IDENTITY_REPAIR_THRESHOLD)
         )
-        if identity is not None and identity < identity_repair_threshold:
+        if (
+            identity is not None
+            and identity < identity_repair_threshold
+            and not self._router.identity_repair_is_worthwhile(
+                judgement, identity_thresholds
+            )
+        ):
             return {"REGENERATE_FROM_ORIGINAL": {"score": 1.0}}
 
-        # Severe quality failures → regenerate
-        if any(f in failures for f in ("face_distorted", "bad_artifacts", "unreadable_image", "bad_resolution", "too_blurry", "multiple_faces", "severe_artifacts")):
-            return {"REGENERATE_FROM_ORIGINAL": {"score": 1.0}}
+        # Severe failures are routed by diagnosis instead of collapsing every
+        # problem into the same blind regeneration.
+        severe = {
+            "face_distorted",
+            "bad_artifacts",
+            "unreadable_image",
+            "bad_resolution",
+            "too_blurry",
+            "multiple_faces",
+            "severe_artifacts",
+            "wrong_composition",
+            "anti_selfie_composition",
+            "synthetic_appearance",
+            "skin_over_smoothed",
+        }
+        if failures & severe:
+            action = diagnosis["recovery_action"]
+            if action == "IDENTITY_REPAIR":
+                action = "REGENERATE_FROM_ORIGINAL"
+            return {action: {"score": 1.0}}
 
         return None
 
@@ -228,6 +277,7 @@ class PolicyEngine:
         edit_count: int,
         identity_repairs: int,
         identity_thresholds: dict | None = None,
+        shot_profile: str = "default",
     ) -> dict[str, dict]:
         """Score every possible action under current context."""
         scores = {}
@@ -249,6 +299,10 @@ class PolicyEngine:
         )
         from .evaluator import EvaluationService
         gate = EvaluationService._candidate_gate_status(judgement, thresholds)
+        diagnosis = classify_failure(
+            judgement,
+            gate_failures=gate.get("hard_gate_failures") or [],
+        )
 
         # Hard constraints already handled in decide() via _hard_constraint_override
         for action in AgentRouter.ALLOWED_ACTIONS:
@@ -304,15 +358,24 @@ class PolicyEngine:
                     score *= 0.2
 
             if action == "IDENTITY_REPAIR":
-                # Boost identity repair when identity is in gray zone
+                # Favor one local identity write whenever the frame is
+                # repairable and identity has not passed yet.
                 if (
                     identity is not None
-                    and identity_repair_threshold <= identity < identity_pass_threshold
+                    and identity < identity_pass_threshold
+                    and self._router.identity_repair_is_worthwhile(
+                        judgement, identity_thresholds
+                    )
                 ):
                     score *= 3.0
 
             if action == "REGENERATE_FROM_ORIGINAL":
                 # High-risk shots benefit more from regeneration
+                score *= (1.0 + risk * 0.5)
+
+            if action == "REGENERATE_WITH_POSE_REFERENCE":
+                if "identity_geometry_drift" in failures:
+                    score *= 5.0
                 score *= (1.0 + risk * 0.5)
 
             # Feedback conditioning is action-specific: dislikes reduce ACCEPT
@@ -327,12 +390,45 @@ class PolicyEngine:
             if action == base_action:
                 score *= 1.1
 
+            learning_adjustment = self._strategy_adjustment(
+                failure_class=diagnosis["failure_class"],
+                action=action,
+                shot_profile=shot_profile,
+            )
+            score *= float(learning_adjustment.get("multiplier") or 1.0)
+
             scores[action] = {
                 "score": max(0.0, min(1.0, score)),
                 "eligible": eligible,
+                "learning_adjustment": learning_adjustment,
             }
 
         return scores
+
+    def _strategy_adjustment(
+        self,
+        *,
+        failure_class: str,
+        action: str,
+        shot_profile: str,
+    ) -> dict:
+        method = getattr(self._learning, "strategy_adjustment", None)
+        if not callable(method):
+            return {"active": False, "multiplier": 1.0}
+        try:
+            return method(
+                failure_class=failure_class,
+                action=action,
+                shot_profile=shot_profile,
+            )
+        except Exception:
+            # Learning evidence must never make generation unavailable. A
+            # malformed or locked analytics store degrades to the static policy.
+            return {
+                "active": False,
+                "multiplier": 1.0,
+                "reason": "strategy_evidence_unavailable",
+            }
 
     @staticmethod
     def _action_is_eligible(
@@ -356,8 +452,7 @@ class PolicyEngine:
                 "DROP_CANDIDATE",
             }
         if action == "REGENERATE_WITH_POSE_REFERENCE":
-            # The current candidate executor has no pose-reference branch.
-            return False
+            return base_action == "REGENERATE_WITH_POSE_REFERENCE"
         if action == "REQUEST_BETTER_REFERENCE":
             return base_action == "REQUEST_BETTER_REFERENCE"
         if action == "DROP_CANDIDATE":
@@ -383,6 +478,16 @@ class PolicyEngine:
             return self.SHOT_RISK_PROFILES["default"]
         shot_type = shot_spec.get("shot_type", "default")
         return self.SHOT_RISK_PROFILES.get(shot_type, self.SHOT_RISK_PROFILES["default"])
+
+    @staticmethod
+    def _shot_profile_name(shot_spec: dict | None) -> str:
+        if not shot_spec:
+            return "default"
+        return str(
+            shot_spec.get("shot_type")
+            or shot_spec.get("shot_id")
+            or "default"
+        )
 
     def _feedback_modifier(self, session_feedback: list[dict] | None, proposed_action: str) -> float:
         """Return -1.0 to +1.0 modifier based on recent user feedback.
@@ -444,3 +549,42 @@ class PolicyEngine:
         else:
             parts.append(f"policy_confirmed")
         return "; ".join(parts)
+
+
+def select_best_variant(variants: list[dict] | None) -> dict | None:
+    """Pick the most real repair-stage variant that passes the hard gates.
+
+    The delivery candidate is chosen across ALL recorded pipeline stages
+    (scaffold, face swap, identity blend, local edit, identity repair,
+    sharpening) instead of defaulting to the last repair output:
+
+    1. Pool = variants whose ``gate_status.hard_gates_pass`` is True and that
+       carry a valid judgement (stages whose judge failed are skipped).
+    2. Sort by VLM realism score first (a missing score counts as -1), then
+       by ``aggregate_score``. Full ties keep the LATER stage, so an
+       equal-scoring pipeline keeps its most processed output.
+    3. Return None when the pool is empty. The caller then keeps the
+       last-stage output and lets the final delivery gate reject it honestly
+       instead of fabricating a pass.
+    """
+    pool = []
+    for position, variant in enumerate(variants or []):
+        judgement = variant.get("judgement")
+        if not isinstance(judgement, dict):
+            continue
+        gate = variant.get("gate_status") or {}
+        if not gate.get("hard_gates_pass"):
+            continue
+        realism = (judgement.get("scores") or {}).get("realism")
+        realism_key = (
+            float(realism) if isinstance(realism, (int, float)) else -1.0
+        )
+        aggregate = variant.get("aggregate_score")
+        aggregate_key = (
+            float(aggregate) if isinstance(aggregate, (int, float)) else -1.0
+        )
+        pool.append((realism_key, aggregate_key, position, variant))
+    if not pool:
+        return None
+    pool.sort(key=lambda item: (item[0], item[1], item[2]))
+    return pool[-1][3]
