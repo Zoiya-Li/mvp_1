@@ -1,6 +1,8 @@
 # FlashShot 项目完整概述与 Pipeline
 
-> 当前状态：2026-07-02 | 后端 136 测试全部通过 | 前端 build 通过 | 5 commits on main
+> 当前状态：2026-07-23 | 后端 241 测试全部通过 | 前端 build 通过 | 13 commits on main
+>
+> 本文已于 2026-07-23 订正(Pricing、生成后端、PolicyEngine/LearningLayer/SmartRouter、测试数与行数);结构真相以根目录 `CLAUDE.md` 为准。
 
 ---
 
@@ -28,23 +30,27 @@
 /Users/lizeyan/Desktop/mvp_1/
 ├── headshot_pipeline/          # Python FastAPI 后端
 │   ├── server/
-│   │   ├── generation/         # NEW: ImageProvider 抽象 + ImageGateway 路由
-│   │   │   ├── providers.py    # OpenRouterProvider, ChromeProvider
-│   │   │   └── gateway.py      # 业务层统一入口
-│   │   ├── evaluation/         # NEW: 拆出的评估系统
+│   │   ├── generation/         # ImageProvider 抽象 + ImageGateway + 任务感知路由
+│   │   │   ├── providers.py    # SiliconFlowProvider(默认) / OpenRouterProvider / ChromeProvider(legacy)
+│   │   │   ├── gateway.py      # 业务层统一入口
+│   │   │   └── smart_router.py # SmartModelRouter —— 任务感知模型路由(cost×identity×latency)
+│   │   ├── evaluation/         # 评估系统
 │   │   │   ├── evaluator.py    # VLM judge + local quality + identity similarity
-│   │   │   └── agent_router.py # 纯决策逻辑状态机
-│   │   ├── repair/             # NEW: 身份修复模块
+│   │   │   ├── agent_router.py # 纯决策逻辑状态机(AgentRouter,内核 + 测试用)
+│   │   │   └── policy_engine.py# PolicyEngine —— 自适应决策(预算/风险/反馈打分),运行时活跃路径
+│   │   ├── learning/           # 反馈→阈值标定
+│   │   │   └── learning_layer.py  # LearningLayer(保守有界增量,SQLite 持久化)
+│   │   ├── repair/             # 身份修复模块
 │   │   │   └── identity_repair.py  # FaceSwapRepair
-│   │   ├── delivery/           # NEW: 交付后处理（占位）
-│   │   ├── gemini_worker.py    # Pipeline 编排器（已从 2820 行降到 1905 行）
-│   │   ├── job_queue.py        # 内存队列 + session 管理
+│   │   ├── delivery/           # 交付后处理（去重/标注/高清化）
+│   │   ├── gemini_worker.py    # Pipeline 编排器(1661 行)
+│   │   ├── job_queue.py        # 单 worker 队列 + session 管理(SQLite 持久化,2128 行)
 │   │   ├── router_jobs.py      # API 路由：hero-preview / unlock / generate
 │   │   ├── router_sessions.py  # API 路由：session CRUD
 │   │   ├── router_payment.py   # API 路由：Paddle 支付
 │   │   ├── router_postprocess.py # API 路由：裁剪/换背景/高清化
-│   │   ├── models.py           # Pydantic 数据模型
-│   │   ├── config.py           # 配置（OpenRouter / Chrome 切换）
+│   │   ├── models.py           # Pydantic 数据模型(TIER_LIMITS 定价 @ line 355)
+│   │   ├── config.py           # 配置(gemini_backend 开关：siliconflow 默认 / openrouter / chrome)
 │   │   ├── openrouter_client.py  # OpenRouter REST API 客户端
 │   │   ├── image_gateway.py    # Provider metadata + cost estimation
 │   │   ├── input_quality.py    # 上传照片质量检查
@@ -54,7 +60,8 @@
 │   │   ├── security.py         # Token / 限流
 │   │   ├── payment.py          # Paddle 支付逻辑
 │   │   └── ...
-│   ├── tests/                  # 136 个测试
+│   ├── tests/                  # 241 个测试
+│   ├── legacy/                 # 已废弃的 chrome-era 死代码(产品不再 import)
 │   └── experiments/            # 实验脚本
 ├── headshot-landing/           # Next.js 16 + TypeScript 前端
 │   ├── src/
@@ -215,6 +222,23 @@ Results（精选结果页：下载/裁剪/换背景/反馈）
        所有调用通过 gateway.create_from_references() / local_edit() / judge()
 ```
 
+### Phase 4: 自适应决策 + 反馈学习 + 任务感知路由（已完成）
+
+```
+evaluation/policy_engine.py  PolicyEngine —— 自适应决策
+  综合预算/风险/反馈打分,替代纯规则状态机;已在 gemini_worker.py:481 接为运行时活跃路径
+  (AgentRouter 作为其内核 + 测试用状态机保留)
+
+learning/learning_layer.py   LearningLayer —— 反馈驱动阈值标定
+  用户 looks_like_me / not_like_me → 保守有界增量调整 identity 阈值,SQLite 持久化
+
+generation/smart_router.py   SmartModelRouter —— 任务感知模型路由
+  按 cost × identity × latency 在 provider 间路由(hero/full-set/edit 走不同策略)
+
+generation/providers.py      新增 SiliconFlowProvider 为默认后端
+  (Qwen-Image-Edit-2509 生成 + Qwen2.5-VL-32B 评判);Chrome 退为 legacy 可选项
+```
+
 ---
 
 ## 5. 关键指标与阈值
@@ -237,13 +261,13 @@ Results（精选结果页：下载/裁剪/换背景/反馈）
 
 ## 6. 商业结构
 
-| 套餐 | 价格 | 权益 |
-|------|------|------|
-| Free | $0 | 1 张低清/水印 Hero Preview |
-| Starter | $9 | 1 个风格，8 张精选 |
-| Standard | $19 | 3 个风格，20-30 张精选，高清下载，1 次重做 |
-| Pro | $39 | 5 个风格，40-60 张精选，更多 revision，高级后处理 |
-| Team | $12-29/人 | 企业统一头像，批量导出，管理后台 |
+| 套餐 | 价格 | 风格数 | 改次数 | 证件照 | 换背景 | 高清下载 |
+|------|------|--------|--------|--------|--------|----------|
+| Free | $0 | 1 | 1 | ✗ | ✗ | ✗ |
+| Standard | $5 | 2 | 2 | ✓ | ✓ | ✗ |
+| Pro | $10 | 2 | 3 | ✓ | ✓ | ✓ |
+
+> 仅 3 档(`server/models.py:355` `TIER_LIMITS`)。海外定价 $5/$10;$19 因太接近 ChatGPT Plus 被否决,无 Starter/Team 档。
 
 **转化路径：**
 
@@ -255,9 +279,9 @@ Results（精选结果页：下载/裁剪/换背景/反馈）
 
 ## 7. 安全与隐私
 
-- **Session Owner Token**：每个 session 有独立 owner token，所有操作需验证
-- **图片 URL 带 Token**：`?token=` 防止未授权访问
-- **支付只走 Paddle Webhook**：前端不直接提权
+- **Session Owner Token**：每个 session 有独立 256-bit owner token,所有操作需验证(常量时间比较);session 不存在也只返 401 不返 404,防 session_id 枚举
+- **图片 URL 带 Token**：`<img src>` 用 `?token=` 携带 owner token,防未授权访问
+- **支付只走 Paddle Webhook(HMAC-SHA256 验签)**:这是唯一提权路径;前端轮询只读,绝不提权
 - **数据保留期**：7 天后删除源文件和生成文件
 - **无长期人脸库**：Identity Pack 是任务级临时数据，任务结束即删除
 - **无跨用户搜索**：cross_user_search = False
@@ -266,13 +290,15 @@ Results（精选结果页：下载/裁剪/换背景/反馈）
 
 ## 8. 测试覆盖
 
-- **136 个后端测试**全部通过
+- **241 个后端测试**全部通过
 - 覆盖：backend switch、resemblance loop、quality pipeline、delivery gate、payment、session rehydrate、upload consent、user feedback、shot planner、image serving、postprocess upscale
 - **前端 build 通过**（Next.js 16 + TypeScript）
 
 ---
 
-## 9. 下一步（Phase 4+）
+## 9. 下一步（Phase 5+）
+
+> 注:原 Phase 4 计划中的"三层评分统一"(第 5 项)、"Multi-model Routing"(第 6 项)、"失败学习系统"(第 7 项)已随 PolicyEngine / SmartModelRouter / LearningLayer 落地,见上文 Phase 4。下面保留的是尚未完成项。
 
 ### 短期（1-2 周）
 

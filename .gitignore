@@ -15,6 +15,8 @@ headshot_pipeline/output/
 headshot_pipeline/uploads/
 # Headless Chrome profile (cookies / session state)
 headshot_pipeline/.chrome_profile/
+# Stale Gemini-web session cookies (committed once by mistake; untracked 2026-07-23)
+headshot_pipeline/.gemini_session/
 # ML model weights (ONNX/RemBG/Lama etc.) — large + non-essential to version
 headshot_pipeline/models/
 **/models/*.onnx

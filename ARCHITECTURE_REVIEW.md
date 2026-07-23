@@ -1,5 +1,12 @@
 # FlashShot 产品级架构验收评估（2026-07-02）
 
+> ⚠️ **本文件为 2026-07-02 时点的评估快照,保留作历史记录。** 此后已发生重大变化:
+> - **PolicyEngine / LearningLayer / SmartModelRouter** 已落地为运行时活跃路径(决策从纯规则状态机升级为自适应);
+> - **SiliconFlow 成为默认生成后端**(Qwen-Image-Edit + Qwen2.5-VL judge),Chrome 退为 legacy 可选项;
+> - 后端测试数从当时的规模增至 **241**,commits 至 **13**。
+>
+> **当前结构状态以根目录 [`CLAUDE.md`](CLAUDE.md) 为准;本评估下文不再逐条订正。**
+
 > 评估视角：产品级架构验收
 > 评估对象：6 commits + 完整代码结构
 > 结论：从 "MVP 写真生成器" → "模块化 AI 写真系统 v1.0"
