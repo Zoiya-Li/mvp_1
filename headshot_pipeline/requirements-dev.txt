@@ -1,5 +1,5 @@
 # Test/dev dependencies — install in addition to requirements.txt.
-# Used by the deploy-time pytest gate (deploy/overseas-vps/DEPLOY_OVERSEAS_VPS.md §4).
+# Used by the deploy-time pytest gate (deploy/DEPLOY_NGINX.md) and by CI (.github/workflows/ci.yml).
 #
 # pytest-asyncio is REQUIRED for the gate to be valid: without it, every
 # @pytest.mark.asyncio test emits PytestUnknownMarkWarning and is silently

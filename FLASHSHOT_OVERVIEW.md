@@ -1,8 +1,10 @@
 # FlashShot 项目完整概述与 Pipeline
 
-> 当前状态：2026-07-23 | 后端 241 测试全部通过 | 前端 build 通过 | 13 commits on main
+> ⚠️ **本文为叙述性背景文档,不再逐条维护。结构真相以根目录 [`CLAUDE.md`](CLAUDE.md) 为准。**
 >
-> 本文已于 2026-07-23 订正(Pricing、生成后端、PolicyEngine/LearningLayer/SmartRouter、测试数与行数);结构真相以根目录 `CLAUDE.md` 为准。
+> 此后重大变化(本文未全面同步):付费路径已切 **Apple IAP**(Paddle 降为 Web 可选)、生产入口为 **nginx on 38.76.165.9**、后端测试增至 **437**(434 绿 + 3 生产既存漂移)、本仓库 2026-07-24 已用生产快照整体对齐。
+>
+> 当前状态快照:后端 434/437 passed(3 xfail)、前端 build 通过。
 
 ---
 
@@ -60,7 +62,7 @@
 │   │   ├── security.py         # Token / 限流
 │   │   ├── payment.py          # Paddle 支付逻辑
 │   │   └── ...
-│   ├── tests/                  # 241 个测试
+│   ├── tests/                  # 437 个测试(434 绿;3 个生产既存漂移,详见 CLAUDE.md)
 │   ├── legacy/                 # 已废弃的 chrome-era 死代码(产品不再 import)
 │   └── experiments/            # 实验脚本
 ├── headshot-landing/           # Next.js 16 + TypeScript 前端
@@ -281,7 +283,7 @@ generation/providers.py      新增 SiliconFlowProvider 为默认后端
 
 - **Session Owner Token**：每个 session 有独立 256-bit owner token,所有操作需验证(常量时间比较);session 不存在也只返 401 不返 404,防 session_id 枚举
 - **图片 URL 带 Token**：`<img src>` 用 `?token=` 携带 owner token,防未授权访问
-- **支付只走 Paddle Webhook(HMAC-SHA256 验签)**:这是唯一提权路径;前端轮询只读,绝不提权
+- **支付提权两条服务端验签路径**:(1) **Apple IAP**(主路径,iOS,App Store Server API + `config/apple-root-certs/` 验签);(2) **Paddle Webhook**(HMAC-SHA256,Web 可选)。前端只读,绝不提权。详见 `CLAUDE.md`。
 - **数据保留期**：7 天后删除源文件和生成文件
 - **无长期人脸库**：Identity Pack 是任务级临时数据，任务结束即删除
 - **无跨用户搜索**：cross_user_search = False
@@ -290,7 +292,7 @@ generation/providers.py      新增 SiliconFlowProvider 为默认后端
 
 ## 8. 测试覆盖
 
-- **241 个后端测试**全部通过
+- **437 个后端测试**(434 passed + 3 xfail,为生产既存代码/测试漂移,详见 `CLAUDE.md`)
 - 覆盖：backend switch、resemblance loop、quality pipeline、delivery gate、payment、session rehydrate、upload consent、user feedback、shot planner、image serving、postprocess upscale
 - **前端 build 通过**（Next.js 16 + TypeScript）
 

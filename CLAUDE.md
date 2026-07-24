@@ -139,7 +139,7 @@ npm run dev      # 或 npm run build && npm start
 HTTPS egress → api.siliconflow.cn(生成)+ Apple App Store Server(IAP 验签)
 ```
 
-> **`headshot_pipeline/deploy/overseas-vps/` 是旧(US/Caddy)部署文档,已过时**;生产实为 nginx on 38.76.165.9,待清理。
+> 部署细节见 [`headshot_pipeline/deploy/DEPLOY_NGINX.md`](headshot_pipeline/deploy/DEPLOY_NGINX.md);`deploy/legacy/` 下为旧(US/Caddy、launchd、cloudflared)方案,已归档勿用。
 > **共享主机硬约束**:这台机器还跑着 grafana.recorrect.cn、plausible.recorrect.cn 等(见 [[recorrect-no-touch]])。**所有改动必须 additive,绝不扰动 co-tenant**。回滚只移除 FlashShot 自身。
 
 ---

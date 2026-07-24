@@ -1,0 +1,92 @@
+# FlashShot CI
+# Runs the backend pytest suite (isolated DATA_DIR, no secrets) and a frontend
+# production build on every push / pull request to main.
+#
+# Backend note: tests do NOT require live API keys (providers are mocked or
+# optional). PAYMENT_MOCK_ENABLED=1 keeps payment-path tests deterministic.
+# APP_ENVIRONMENT is intentionally left unset -> defaults to "development"
+# (config.Settings forbids the literal value "test").
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Backend (pytest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    defaults:
+      run:
+        working-directory: headshot_pipeline
+
+    env:
+      DATA_DIR: ${{ runner.temp }}/flashshot-data
+      PAYMENT_MOCK_ENABLED: "1"
+      SESSION_SECRET_KEY: ci-dummy-secret-key-for-tests-only-32chars
+      GEMINI_BACKEND: siliconflow
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: headshot_pipeline/requirements.txt
+
+      - name: Install backend deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          # dev/test pins (pytest + pytest-asyncio versions that match the local gate)
+          if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
+
+      - name: Create isolated DATA_DIR
+        run: mkdir -p "$DATA_DIR"
+
+      - name: Run pytest
+        run: |
+          python -m pytest tests/ -q \
+            --junitxml=pytest-results.xml
+
+      - name: Upload pytest results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-pytest-results
+          path: headshot_pipeline/pytest-results.xml
+          if-no-files-found: ignore
+
+  frontend:
+    name: Frontend (next build)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: headshot-landing
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: headshot-landing/package-lock.json
+
+      - name: Install frontend deps
+        run: npm ci
+
+      - name: Build
+        run: npm run build
