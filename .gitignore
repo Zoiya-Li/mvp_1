@@ -57,3 +57,9 @@ build/
 .vscode/
 *.swp
 gemini-image-gen-automation/
+
+# ── iOS / Xcode (user state & build artifacts) ──
+# build/ and .DS_Store are already covered by the global rules above.
+ios/**/xcuserdata/
+*.xcuserstate
+ios/**/DerivedData/

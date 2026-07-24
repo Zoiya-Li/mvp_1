@@ -24,7 +24,7 @@ mvp_1/
 │   ├── persistent_client.py / watermark_remover.py  # chrome 后端耦合单元(仅 chrome 后端可达)
 │   └── models/  data/  output/  .chrome_profile/    # 运行时(gitignore)
 ├── headshot-landing/       # 前端(Next.js 16 + React 19 + TS + Tailwind v4)
-├── gemini-image-gen-automation/  # 第三方嵌套 git 仓库(gitignore,零引用)
+├── ios/                    # iOS 原生 SwiftUI app(XcodeGen 工程 + Apple IAP + AppStore 提交材料,连生产 /api/v2;2026-07-24 从 Codex 副本合并)
 ├── FLASHSHOT_OVERVIEW.md   # 项目叙述(已订正)
 └── ARCHITECTURE_REVIEW.md  # 2026-07-02 架构评估快照
 ```

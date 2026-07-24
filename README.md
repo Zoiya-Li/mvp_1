@@ -12,6 +12,7 @@
 mvp_1/
 ├── headshot_pipeline/   后端 FastAPI(产品核心)—— server/ 分层见 CLAUDE.md
 ├── headshot-landing/    前端 Next.js 16 + React 19 + TS + Tailwind v4(对应生产 web/)
+├── ios/                 iOS 原生 SwiftUI app(XcodeGen 工程 + Apple IAP + AppStore 提交材料,连生产 /api/v2)
 └── CLAUDE.md            ⭐ 当前结构真相(IAP / nginx / 437 测试 / prod=38.76.165.9)
 ```
 

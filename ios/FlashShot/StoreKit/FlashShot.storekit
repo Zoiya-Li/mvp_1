@@ -1,0 +1,46 @@
+{
+  "identifier" : "2E158F0E-3B08-4E98-91AA-6F286B99E979",
+  "nonRenewingSubscriptions" : [
+
+  ],
+  "products" : [
+    {
+      "displayPrice" : "9.99",
+      "familyShareable" : false,
+      "internalID" : "B5C05D77-7F1B-4C14-876B-B46F5A4D9968",
+      "localizations" : [
+        {
+          "description" : "Unlock the remaining five portraits and receive one complete six-photo set.",
+          "displayName" : "Six Portrait Set",
+          "locale" : "en_US"
+        },
+        {
+          "description" : "解锁其余五张写真，获得完整六张套图。",
+          "displayName" : "六张写真套装",
+          "locale" : "zh_Hans"
+        }
+      ],
+      "productID" : "portrait_set_6",
+      "referenceName" : "FlashShot Six Portrait Set",
+      "type" : "Consumable"
+    }
+  ],
+  "settings" : {
+    "_applicationInternalID" : "0000000000",
+    "_developerTeamID" : "",
+    "_failTransactionsEnabled" : false,
+    "_lastSynchronizedDate" : 0,
+    "_locale" : "en_US",
+    "_storefront" : "USA",
+    "_storeKitErrors" : [
+
+    ]
+  },
+  "subscriptionGroups" : [
+
+  ],
+  "version" : {
+    "major" : 4,
+    "minor" : 0
+  }
+}
